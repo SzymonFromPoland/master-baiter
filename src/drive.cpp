@@ -14,10 +14,10 @@ void drive(int speed_left, int speed_right) {
     digitalWrite(tb_pins[4], LOW);  // BIN1
     digitalWrite(tb_pins[3], LOW);  // BIN2
   } else {
-    digitalWrite(tb_pins[2], speed_left >= 0 ? HIGH : LOW);   // AIN1
-    digitalWrite(tb_pins[1], speed_left >= 0 ? LOW : HIGH);   // AIN2
-    digitalWrite(tb_pins[4], speed_right >= 0 ? HIGH : LOW);  // BIN1
-    digitalWrite(tb_pins[3], speed_right >= 0 ? LOW : HIGH);  // BIN2
+    digitalWrite(tb_pins[1], speed_left >= 0 ? HIGH : LOW);   // AIN1
+    digitalWrite(tb_pins[2], speed_left >= 0 ? LOW : HIGH);   // AIN2
+    digitalWrite(tb_pins[3], speed_right >= 0 ? HIGH : LOW);  // BIN1
+    digitalWrite(tb_pins[4], speed_right >= 0 ? LOW : HIGH);  // BIN2
   }
 
   analogWrite(tb_pins[0], pwm_left);   // pwm A
