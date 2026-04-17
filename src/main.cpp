@@ -5,11 +5,13 @@
 #include <Adafruit_MPU6050.h>
 #include <Preferences.h>
 
-#include "drive.h"
-#include "something.h"
-#include "config.h"
+#include <tuner.h>
+#include <drive.h>
+#include <something.h>
+#include <config.h>
 
 VL53L1X_ULD sensor[SENSOR_COUNT];
+VL53L1X_Result_t results[SENSOR_COUNT];
 uint16_t distances[SENSOR_COUNT];
 
 Adafruit_MPU6050 mpu;
@@ -29,6 +31,8 @@ float Kp = 50.0;
 float Ki = 0.0;
 float Kd = 20.0;
 
+float error, output;
+
 bool started = false;
 bool tornado = false;
 bool startup_done = false;
@@ -46,28 +50,37 @@ void calibrate_gyro_bias()
   {
     mpu.getEvent(&a, &g, &temp);
     sum += g.gyro.z;
-    delay(5);
   }
 
   gyro_bias = sum / (float)samples;
-  Serial.println(gyro_bias);
 }
 
 void setup()
 {
   Serial.begin(115200);
+  delay(2500);
   Wire.begin(5, 6);
 
-  prefs.begin("robot", false);
-  Kp = prefs.getFloat("kp", 50.0);
-  Kd = prefs.getFloat("kd", 20.0);
-  prefs.end();
+  Serial.println("Starting setup...");
+  // prefs.begin("robot", false);
+  // Kp = prefs.getFloat("kp", 50.0);
+  // Kd = prefs.getFloat("kd", 20.0);
+  // prefs.end();
 
-  flag.attach(FLAG);
+  ESP32PWM::allocateTimer(0);
+  ESP32PWM::allocateTimer(1);
+  ESP32PWM::allocateTimer(2);
+  ESP32PWM::allocateTimer(3);
+  flag.setPeriodHertz(50);
+  flag.attach(4);
 
-  pinMode(START, INPUT_PULLUP);
+  Serial.println("Setting up pins...1");
+
+  pinMode(14, INPUT_PULLUP);
   pinMode(DIP1, INPUT_PULLUP);
   pinMode(DIP2, INPUT_PULLUP);
+
+  Serial.println("Setting up pins...2");
 
   for (int pin : tb_pins)
     pinMode(pin, OUTPUT);
@@ -86,6 +99,7 @@ void setup()
 
   delay(50);
 
+  Serial.println("Initializing sensors...");
   if (!init_sensor(sensor[0], 0x55, XSHUT1))
     while (1)
       ;
@@ -102,6 +116,7 @@ void setup()
     while (1)
       ;
 
+  Serial.println("Setting sensor settings...");
   uint16_t roi[2] = {13, 4};
   set_sensor_settings(sensor[0], Short, roi, 20, 20, threshold);
   set_sensor_settings(sensor[1], Short, roi, 20, 20, threshold);
@@ -109,6 +124,11 @@ void setup()
   set_sensor_settings(sensor[3], Short, roi, 20, 20, threshold);
   set_sensor_settings(sensor[4], Short, roi, 20, 20, threshold);
 
+  // WAZNE INFO!
+  // KLAIBRACJA ZAWSZE PO WLACZENIU ROBOTA, NIE TRZYMAC GO W RUCHU PRZEZ PIERWSZE ~3 SEKUNDY, BO INACZEJ ZROBI SIE OGROMNY GYRO BIAS I ROBOT BEDZIE SIE CIAGLE KRECIL W JEDNA STRONE!
+  // POLOZYC NA RINGU, WLACZYC I DOPIERO PO ~3 SEKUNDACH COS USTAWIAC!
+
+  Serial.println("Initializing MPU6050...");
   if (mpu.begin(0x68))
   {
     mpu.setAccelerometerRange(MPU6050_RANGE_16_G);
@@ -120,6 +140,15 @@ void setup()
     delay(200);
     calibrate_gyro_bias();
   }
+
+  Serial.println("Done with setup!");
+
+  static TuningParam mySettings[] = {
+      {"PID Error", "err", &error, 0, 0, 0, TYPE_READONLY},
+      {"PID Output", "out", &output, 0, 0, 0, TYPE_READONLY},
+
+  };
+  startTuner(mySettings, sizeof(mySettings) / sizeof(mySettings[0]), results, SENSOR_COUNT, &prefs);
 
   weights(0, 0);
 }
@@ -138,8 +167,6 @@ void loop()
   yaw += rate * dt;
   yaw = fmod(yaw + 360.0f, 360.0f);
 
-  VL53L1X_Result_t result[SENSOR_COUNT];
-
   bool any_under_theshold1 = false;
   bool any_under_theshold2 = false;
   bool any_under_theshold3 = false;
@@ -149,8 +176,8 @@ void loop()
 
   for (int i = 0; i < SENSOR_COUNT; i++)
   {
-    sensor[i].GetResult(&result[i]);
-    distances[i] = (result[i].Status == 0) ? result[i].Distance : threshold;
+    sensor[i].GetResult(&results[i]);
+    distances[i] = (results[i].Status == 0) ? results[i].Distance : threshold;
 
     if (distances[i] < threshold)
       sensor[i].ClearInterrupt();
@@ -165,8 +192,8 @@ void loop()
     num += s * (i - 2);
     denom += s;
   }
-  float error = (denom > 0.0001f) ? (num / denom) : 0.0f;
-  float output = pid(error, dt, Kp, Ki, Kd, drivePID, 1.0f, 1000.0f);
+  error = (denom > 0.0001f) ? (num / denom) : 0.0f;
+  output = pid(error, dt, Kp, Ki, Kd, drivePID, 1.0f, 1000.0f);
 
   bool dip1 = !digitalRead(DIP1);
   bool dip2 = !digitalRead(DIP2);
@@ -218,7 +245,7 @@ void loop()
           drive(100, -100);
 
         servo_direction = 1;
-        
+
         delay((last_seen == -1) ? 220 : 110);
 
         drive(100 - last_seen * 50, 100 + last_seen * 50);
@@ -247,5 +274,5 @@ void loop()
     drive(0, 0);
   }
 
-  Serial.printf("%.1fms\t%.1f°\t%d %d\t%d\t%d\t%d\t%d\t%d\t%.1f\n", dt * 1000, yaw, dip1, dip2, distances[0], distances[1], distances[2], distances[3], distances[4], error);
+  // Serial.printf("%.1fms\t%.1f°\t%d %d\t%d\t%d\t%d\t%d\t%d\t%.1f\n", dt * 1000, yaw, dip1, dip2, distances[0], distances[1], distances[2], distances[3], distances[4], error);
 }

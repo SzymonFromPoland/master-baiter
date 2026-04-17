@@ -11,31 +11,6 @@ unsigned long weights_start_time = 0;
 bool weights_active = false;
 int weights_pos = 0;
 
-bool init_sensor(VL53L1X_ULD &sensor, uint8_t address, uint8_t xshut)
-{
-    digitalWrite(xshut, HIGH);
-    delay(50);
-    if (sensor.Begin(address) != VL53L1_ERROR_NONE)
-    {
-        Serial.printf("Sensor at 0x%X failed to init\n", address);
-        return 0;
-    }
-    sensor.SetI2CAddress(address);
-    delay(10);
-    return 1;
-}
-
-void set_sensor_settings(VL53L1X_ULD &sensor, EDistanceMode mode, uint16_t roi[2], uint16_t timing_budget, uint16_t inter_measurement, uint16_t threshold)
-{
-    sensor.SetDistanceMode(mode);
-    sensor.SetROI(roi[0], roi[1]);
-    sensor.SetTimingBudgetInMs(timing_budget);
-    sensor.SetInterMeasurementInMs(inter_measurement);
-    sensor.SetInterruptPolarity(ActiveLOW);
-    sensor.SetDistanceThreshold(0, threshold, Out);
-    sensor.StartRanging();
-}
-
 void weights(int speed2, int speed1)
 {
     speed1 = constrain(speed1, -255, 255);
@@ -92,7 +67,30 @@ void handle_weights(unsigned long now)
     }
 }
 
+bool init_sensor(VL53L1X_ULD &sensor, uint8_t address, uint8_t xshut)
+{
+    digitalWrite(xshut, HIGH);
+    delay(50);
+    if (sensor.Begin(address) != VL53L1_ERROR_NONE)
+    {
+        Serial.printf("Sensor at 0x%X failed to init\n", address);
+        return 0;
+    }
+    sensor.SetI2CAddress(address);
+    delay(10);
+    return 1;
+}
 
+void set_sensor_settings(VL53L1X_ULD &sensor, EDistanceMode mode, uint16_t roi[2], uint16_t timing_budget, uint16_t inter_measurement, uint16_t threshold)
+{
+    sensor.SetDistanceMode(mode);
+    sensor.SetROI(roi[0], roi[1]);
+    sensor.SetTimingBudgetInMs(timing_budget);
+    sensor.SetInterMeasurementInMs(inter_measurement);
+    sensor.SetInterruptPolarity(ActiveLOW);
+    sensor.SetDistanceThreshold(0, threshold, Out);
+    sensor.StartRanging();
+}
 
 float pid(float error, float dt, float Kp, float Ki, float Kd, PIDState &state, float alpha, float integral_limit)
 {
