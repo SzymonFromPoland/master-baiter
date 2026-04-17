@@ -1,7 +1,4 @@
-#ifndef DRIVE_H
-#define DRIVE_H
-
-#include <Arduino.h>
+#include "config.h"
 
 const int tb_pins[10] = {
     1,  // pwm A
@@ -15,7 +12,3 @@ const int tb_pins[10] = {
     8,  // pwm C1
     21  // pwm C2
 };
-
-void drive(int speed_left, int speed_right);
-
-#endif

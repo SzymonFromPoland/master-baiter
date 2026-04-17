@@ -2,200 +2,55 @@
 #include <Wire.h>
 #include <ESP32Servo.h>
 #include <VL53L1X_ULD.h>
-#include <WiFi.h>
-#include <WebServer.h>
-#include <EEPROM.h>
+#include <Adafruit_MPU6050.h>
+#include <Preferences.h>
 
 #include "drive.h"
-#include "index.h"
+#include "something.h"
+#include "config.h"
 
-VL53L1X_ULD sensor1;
-VL53L1X_ULD sensor2;
-VL53L1X_ULD sensor3;
-VL53L1X_ULD sensor4;
-VL53L1X_ULD sensor5;
+VL53L1X_ULD sensor[SENSOR_COUNT];
+uint16_t distances[SENSOR_COUNT];
 
+Adafruit_MPU6050 mpu;
+Preferences prefs;
 Servo flag;
 
-#define XSHUT1 13
-#define XSHUT2 12
-#define XSHUT3 11
-#define XSHUT4 10
-#define XSHUT5 9
-
-#define DIP1 48
-#define TIP2 47
-#define START 14
+float yaw = 0.0f;
+float gyro_bias = 0.0f;
+unsigned long lastTime = 0;
 
 const uint16_t threshold = 770;
 const uint16_t threshold2 = threshold - 150;
 const uint16_t threshold3 = 350;
 
+PIDState drivePID;
 float Kp = 50.0;
+float Ki = 0.0;
 float Kd = 20.0;
 
-float prev_error = 0;
-float error_web = 0;
-float output_web = 0;
+bool started = false;
+bool tornado = false;
+bool startup_done = false;
+int base_speed = 100;
+int last_seen = 1;
+long start = 0;
 
-WebServer server(80);
-
-float pd(float error, float dt, float Kp, float Kd)
+void calibrate_gyro_bias()
 {
-  if (dt <= 0.0001f)
-    dt = 0.001f;
+  int samples = 200;
+  float sum = 0;
+  sensors_event_t a, g, temp;
 
-  float proportional = Kp * error;
-  float derivative = Kd * ((error - prev_error) / dt);
-  prev_error = error;
-  return proportional + derivative;
-}
-
-bool init_sensor(VL53L1X_ULD &sensor, uint8_t address, uint8_t xshut)
-{
-  digitalWrite(xshut, HIGH);
-  delay(50);
-  if (sensor.Begin(address) != VL53L1_ERROR_NONE)
+  for (int i = 0; i < samples; i++)
   {
-    Serial.printf("Sensor at 0x%X failed to init\n", address);
-    return 0;
+    mpu.getEvent(&a, &g, &temp);
+    sum += g.gyro.z;
+    delay(5);
   }
-  sensor.SetI2CAddress(address);
-  delay(10);
-  return 1;
-}
 
-void set_sensor_settings(VL53L1X_ULD &sensor, EDistanceMode mode, uint16_t roi[2],
-                         uint16_t timing_budget, uint16_t inter_measurement, uint16_t threshold)
-{
-  sensor.SetDistanceMode(mode);
-  sensor.SetROI(roi[0], roi[1]);
-  sensor.SetTimingBudgetInMs(timing_budget);
-  sensor.SetInterMeasurementInMs(inter_measurement);
-  sensor.SetInterruptPolarity(ActiveLOW);
-  sensor.SetDistanceThreshold(0, threshold, Out);
-  sensor.StartRanging();
-}
-
-void weights(int speed2, int speed1)
-{
-  speed1 = constrain(speed1, -255, 255);
-  speed2 = constrain(speed2, -255, 255);
-
-  digitalWrite(tb_pins[6], speed1 >= 0 ? LOW : HIGH);
-  digitalWrite(tb_pins[7], speed2 >= 0 ? HIGH : LOW);
-  analogWrite(tb_pins[8], abs(speed1));
-  analogWrite(tb_pins[9], abs(speed2));
-}
-
-int weights_pos = 0;
-TaskHandle_t Task1;
-
-void weights_task(void *parameter)
-{
-  bool toggle = false;
-  for (;;)
-  {
-    if (weights_pos == 0 && toggle)
-    {
-      weights(-253, -255);
-      delay(295);
-      weights(0, 0);
-      toggle = false;
-    }
-    else if (weights_pos == 1 && !toggle)
-    {
-      weights(255, 250);
-      delay(295);
-      weights(0, 0);
-      toggle = true;
-    }
-    vTaskDelay(10 / portTICK_PERIOD_MS);
-  }
-}
-
-uint16_t distances[5];
-bool running = false;
-
-TaskHandle_t ServoTask;
-
-volatile int servo_direction = 0;
-volatile bool servo_toggle = true;
-
-void servo_task(void *parameter)
-{
-  const int stop_signal = 95;
-  const int speed = 100;
-
-  for (;;)
-  {
-    if (servo_direction != 0 && servo_toggle)
-    {
-      if (servo_direction == 1)
-        flag.write(90 + speed);
-      else if (servo_direction == -1)
-        flag.write(90 - speed);
-
-      vTaskDelay(140 / portTICK_PERIOD_MS);
-
-      flag.write(stop_signal); // stop
-      servo_toggle = false;
-    }
-
-    vTaskDelay(10 / portTICK_PERIOD_MS);
-  }
-}
-
-void handleRoot()
-{
-  String page = index_html;
-  page.replace("%D1%", String(distances[0]));
-  page.replace("%D2%", String(distances[1]));
-  page.replace("%D3%", String(distances[2]));
-  page.replace("%D4%", String(distances[3]));
-  page.replace("%D5%", String(distances[4]));
-  page.replace("%ERROR%", String(error_web));
-  page.replace("%OUTPUT%", String(output_web));
-  page.replace("%KP%", String(Kp));
-  page.replace("%KD%", String(Kd));
-  server.send(200, "text/html", page);
-}
-
-void handleUpdate()
-{
-  if (server.hasArg("Kp"))
-  {
-    Kp = server.arg("Kp").toFloat();
-    EEPROM.put(0, Kp);
-    EEPROM.commit();
-  }
-  if (server.hasArg("Kd"))
-  {
-    Kd = server.arg("Kd").toFloat();
-    EEPROM.put(4, Kd);
-    EEPROM.commit();
-  }
-  server.send(200, "text/plain", "PID updated");
-}
-
-void handleControl()
-{
-  if (server.hasArg("action"))
-  {
-    String action = server.arg("action");
-    running = (action == "Start");
-  }
-  server.send(200, "text/plain", running ? "Running" : "Stopped");
-}
-
-void handleData()
-{
-  String json = "{";
-  json += "\"dist\":[" + String(distances[0]) + "," + String(distances[1]) + "," + String(distances[2]) + "," + String(distances[3]) + "," + String(distances[4]) + "],";
-  json += "\"error\":" + String(error_web, 3) + ",";
-  json += "\"output\":" + String(output_web, 3);
-  json += "}";
-  server.send(200, "application/json", json);
+  gyro_bias = sum / (float)samples;
+  Serial.println(gyro_bias);
 }
 
 void setup()
@@ -203,16 +58,16 @@ void setup()
   Serial.begin(115200);
   Wire.begin(5, 6);
 
-  EEPROM.begin(16);
-  EEPROM.get(0, Kp);
-  EEPROM.get(4, Kd);
+  prefs.begin("robot", false);
+  Kp = prefs.getFloat("kp", 50.0);
+  Kd = prefs.getFloat("kd", 20.0);
+  prefs.end();
 
-  flag.attach(4);
-  xTaskCreatePinnedToCore(servo_task, "servo_task", 2048, NULL, 1, &ServoTask, 1);
+  flag.attach(FLAG);
 
-  pinMode(14, INPUT_PULLUP);
+  pinMode(START, INPUT_PULLUP);
   pinMode(DIP1, INPUT_PULLUP);
-  pinMode(TIP2, INPUT_PULLUP);
+  pinMode(DIP2, INPUT_PULLUP);
 
   for (int pin : tb_pins)
     pinMode(pin, OUTPUT);
@@ -231,134 +86,111 @@ void setup()
 
   delay(50);
 
-  if (!init_sensor(sensor1, 0x55, XSHUT1))
+  if (!init_sensor(sensor[0], 0x55, XSHUT1))
     while (1)
       ;
-  if (!init_sensor(sensor2, 0x60, XSHUT2))
+  if (!init_sensor(sensor[1], 0x60, XSHUT2))
     while (1)
       ;
-  if (!init_sensor(sensor3, 0x65, XSHUT3))
+  if (!init_sensor(sensor[2], 0x65, XSHUT3))
     while (1)
       ;
-  if (!init_sensor(sensor4, 0x70, XSHUT4))
+  if (!init_sensor(sensor[3], 0x70, XSHUT4))
     while (1)
       ;
-  if (!init_sensor(sensor5, 0x75, XSHUT5))
+  if (!init_sensor(sensor[4], 0x75, XSHUT5))
     while (1)
       ;
 
   uint16_t roi[2] = {13, 4};
-  set_sensor_settings(sensor1, Short, roi, 20, 20, threshold);
-  set_sensor_settings(sensor2, Short, roi, 20, 20, threshold);
-  set_sensor_settings(sensor3, Short, roi, 20, 20, threshold);
-  set_sensor_settings(sensor4, Short, roi, 20, 20, threshold);
-  set_sensor_settings(sensor5, Short, roi, 20, 20, threshold);
+  set_sensor_settings(sensor[0], Short, roi, 20, 20, threshold);
+  set_sensor_settings(sensor[1], Short, roi, 20, 20, threshold);
+  set_sensor_settings(sensor[2], Short, roi, 20, 20, threshold);
+  set_sensor_settings(sensor[3], Short, roi, 20, 20, threshold);
+  set_sensor_settings(sensor[4], Short, roi, 20, 20, threshold);
 
-  Serial.println("All sensors initialized and ranging");
+  if (mpu.begin(0x68))
+  {
+    mpu.setAccelerometerRange(MPU6050_RANGE_16_G);
+    mpu.setGyroRange(MPU6050_RANGE_2000_DEG);
+    mpu.setFilterBandwidth(MPU6050_BAND_260_HZ);
+    mpu.setSampleRateDivisor(0);
+    mpu.setHighPassFilter(MPU6050_HIGHPASS_0_63_HZ);
 
-  xTaskCreatePinnedToCore(weights_task, "weights_task1", 2048, NULL, 1, &Task1, 1);
+    delay(200);
+    calibrate_gyro_bias();
+  }
+
   weights(0, 0);
-
-  // ---- Wi-Fi Setup ----
-  WiFi.softAP(ssid, password);
-  Serial.print("WiFi AP started. IP: ");
-  Serial.println(WiFi.softAPIP());
-
-  server.on("/", handleRoot);
-  server.on("/update", handleUpdate);
-  server.on("/control", handleControl);
-  server.on("/data", handleData);
-  server.begin();
 }
-
-bool tornado = false;
-bool startup_done = false;
-int base_speed = 100;
-int last_seen = 1;
-
-unsigned long lastTime = 0;
-long start = 0;
 
 void loop()
 {
-  server.handleClient();
-
   unsigned long now = millis();
   float dt = (now - lastTime) / 1000.0;
   lastTime = now;
 
-  VL53L1X_Result_t result1, result2, result3, result4, result5;
-  sensor1.GetResult(&result1);
-  sensor2.GetResult(&result2);
-  sensor3.GetResult(&result3);
-  sensor4.GetResult(&result4);
-  sensor5.GetResult(&result5);
+  started = digitalRead(START) == HIGH;
 
-  uint16_t dist1 = result1.Distance, dist2 = result2.Distance, dist3 = result3.Distance, dist4 = result4.Distance, dist5 = result5.Distance;
-  uint8_t status1 = result1.Status, status2 = result2.Status, status3 = result3.Status, status4 = result4.Status, status5 = result5.Status;
+  sensors_event_t a, g, temp;
+  mpu.getEvent(&a, &g, &temp);
+  float rate = (g.gyro.z - gyro_bias) * RAD_TO_DEG;
+  yaw += rate * dt;
+  yaw = fmod(yaw + 360.0f, 360.0f);
 
-  if (status1 != 0 || dist1 > threshold)
-    dist1 = threshold;
-  if (status2 != 0 || dist2 > threshold)
-    dist2 = threshold;
-  if (status3 != 0 || dist3 > threshold)
-    dist3 = threshold;
-  if (status4 != 0 || dist4 > threshold)
-    dist4 = threshold;
-  if (status5 != 0 || dist5 > threshold)
-    dist5 = threshold;
+  VL53L1X_Result_t result[SENSOR_COUNT];
 
-  distances[0] = dist1;
-  distances[1] = dist2;
-  distances[2] = dist3;
-  distances[3] = dist4;
-  distances[4] = dist5;
+  bool any_under_theshold1 = false;
+  bool any_under_theshold2 = false;
+  bool any_under_theshold3 = false;
 
-  if (dist1 < threshold)
-    sensor1.ClearInterrupt();
-  if (dist2 < threshold)
-    sensor2.ClearInterrupt();
-  if (dist3 < threshold)
-    sensor3.ClearInterrupt();
-  if (dist4 < threshold)
-    sensor4.ClearInterrupt();
-  if (dist5 < threshold)
-    sensor5.ClearInterrupt();
+  float num = 0.0f;
+  float denom = 0.0f;
 
-  bool dip1 = digitalRead(DIP1);
-  bool dip2 = digitalRead(TIP2);
+  for (int i = 0; i < SENSOR_COUNT; i++)
+  {
+    sensor[i].GetResult(&result[i]);
+    distances[i] = (result[i].Status == 0) ? result[i].Distance : threshold;
 
-  bool any_under_theshold = dist1 < threshold || dist2 < threshold || dist3 < threshold || dist4 < threshold || dist5 < threshold;
-  bool any_under_theshold2 = dist1 < threshold2 || dist2 < threshold2 || dist3 < threshold2 || dist4 < threshold2 || dist5 < threshold2;
-  bool any_under_theshold3 = dist1 < threshold3 || dist2 < threshold3 || dist3 < threshold3 || dist4 < threshold3 || dist5 < threshold3;
+    if (distances[i] < threshold)
+      sensor[i].ClearInterrupt();
+    if (distances[i] < threshold)
+      any_under_theshold1 = true;
+    if (distances[i] < threshold2)
+      any_under_theshold2 = true;
+    if (distances[i] < threshold3)
+      any_under_theshold3 = true;
 
-  const float eps = 0.000001f;
-  float s1 = 1 / (dist1 + eps), s2 = 1 / (dist2 + eps), s3 = 1 / (dist3 + eps), s4 = 1 / (dist4 + eps), s5 = 1 / (dist5 + eps);
-  float error = (s1 * -2 + s2 * -1 + s3 * 0 + s4 * 1 + s5 * 2) / (s1 + s2 + s3 + s4 + s5);
-  float output = pd(error, dt, Kp, Kd);
+    float s = 1.0f / (distances[i] + 0.000001f);
+    num += s * (i - 2);
+    denom += s;
+  }
+  float error = (denom > 0.0001f) ? (num / denom) : 0.0f;
+  float output = pid(error, dt, Kp, Ki, Kd, drivePID, 1.0f, 1000.0f);
 
-  error_web = error;
-  output_web = output;
+  bool dip1 = !digitalRead(DIP1);
+  bool dip2 = !digitalRead(DIP2);
 
-  if (error < -0.1f)
+  if (error < -0.01f)
     last_seen = -1;
-  else if (error > 0.1f)
+  else if (error > 0.01f)
     last_seen = 1;
 
-  if (digitalRead(START) == HIGH || running)
+  handle_servo(now);
+  handle_weights(now);
+
+  if (started)
   {
-    if (any_under_theshold)
-    {
+    if (any_under_theshold1)
       servo_direction = 1;
-    }
 
     if (any_under_theshold2 || millis() - start > 767)
       tornado = true;
 
-    if (dip2 && dist3 < 30)
+    if (dip2 && distances[2] < 30)
       weights_pos = 1;
 
-    if (dist3 < 40 && startup_done)
+    if (distances[2] < 40 && startup_done)
     {
       base_speed = 100;
       output = 0;
@@ -367,7 +199,7 @@ void loop()
     {
       base_speed = 35;
     }
-    else if (any_under_theshold && startup_done)
+    else if (any_under_theshold1 && startup_done)
     {
       base_speed = 100;
     }
@@ -386,8 +218,7 @@ void loop()
           drive(100, -100);
 
         servo_direction = 1;
-
-        // delay((dip2) ? 200 : 130);
+        
         delay((last_seen == -1) ? 220 : 110);
 
         drive(100 - last_seen * 50, 100 + last_seen * 50);
@@ -405,15 +236,16 @@ void loop()
 
     int speed_left = base_speed + output;
     int speed_right = base_speed - output;
-    drive(speed_left, speed_right);
+    // drive(speed_left, speed_right);
   }
   else
   {
     weights_pos = 0;
-    running = false;
     tornado = false;
     startup_done = false;
     start = millis();
     drive(0, 0);
   }
+
+  Serial.printf("%.1fms\t%.1f°\t%d %d\t%d\t%d\t%d\t%d\t%d\t%.1f\n", dt * 1000, yaw, dip1, dip2, distances[0], distances[1], distances[2], distances[3], distances[4], error);
 }
