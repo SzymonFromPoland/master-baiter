@@ -17,7 +17,7 @@ struct PIDState
 extern Servo flag;
 extern PIDState drivePID;
 extern unsigned long servo_start_time;
-extern volatile int servo_direction;
+extern volatile int servo_pos;
 extern volatile bool servo_toggle;
 extern const int servo_stop_signal;
 extern const int servo_speed;

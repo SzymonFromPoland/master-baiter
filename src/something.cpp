@@ -1,7 +1,7 @@
 #include <something.h>
 
 unsigned long servo_start_time = 0;
-volatile int servo_direction = 0;
+volatile int servo_pos = 0;
 volatile bool servo_toggle = true;
 const int servo_stop_signal = 95;
 const int servo_speed = 100;
@@ -24,13 +24,13 @@ void weights(int speed2, int speed1)
 
 void handle_servo(unsigned long now)
 {
-    if (servo_direction != 0 && servo_toggle && !servo_active)
+    if (servo_pos != 0 && servo_toggle && !servo_active)
     {
         servo_active = true;
         servo_start_time = now;
-        if (servo_direction == 1)
+        if (servo_pos == 1)
             flag.write(90 + servo_speed);
-        else if (servo_direction == -1)
+        else if (servo_pos == -1)
             flag.write(90 - servo_speed);
         servo_toggle = false;
     }
@@ -44,22 +44,25 @@ void handle_servo(unsigned long now)
 
 void handle_weights(unsigned long now)
 {
-    static bool weights_toggle = false;
-    if (weights_pos == 0 && weights_toggle && !weights_active)
-    {
-        weights_active = true;
-        weights_start_time = now;
-        weights(-255, -255);
-        weights_toggle = false;
-    }
-    else if (weights_pos == 1 && !weights_toggle && !weights_active)
-    {
-        weights_active = true;
-        weights_start_time = now;
-        weights(255, 255);
-        weights_toggle = true;
-    }
+    static int prev_pos = 0;
 
+    if (weights_pos != prev_pos && !weights_active)
+    {
+        weights_active = true;
+        weights_start_time = now;
+
+        if (weights_pos == 1 && prev_pos == 0)
+        {
+            weights(-255, -255);
+        }
+        else if (weights_pos == 0 && prev_pos == 1)
+        {
+            weights(255, 255);
+        }
+
+        prev_pos = weights_pos;
+    }
+    
     if (weights_active && (now - weights_start_time >= 350))
     {
         weights(0, 0);

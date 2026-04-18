@@ -13,6 +13,7 @@
 VL53L1X_ULD sensor[SENSOR_COUNT];
 VL53L1X_Result_t results[SENSOR_COUNT];
 uint16_t distances[SENSOR_COUNT];
+uint16_t spads[SENSOR_COUNT];
 
 Adafruit_MPU6050 mpu;
 Preferences prefs;
@@ -40,11 +41,13 @@ float gyroKi = 0.0;
 float gyroKd = 20.0;
 
 float threshold = 770;
-float threshold2 = threshold - 150;
+float threshold2 = threshold - 200;
 float threshold3 = 350;
 
 float error, output, left_speed, right_speed, to_target, gyro_output;
 int last_seen = 1;
+bool startup_done = false;
+
 void calibrate_gyro_bias()
 {
   int samples = 200;
@@ -66,22 +69,12 @@ void setup()
   delay(2500);
   Wire.begin(5, 6);
 
-  Serial.println("Starting setup...");
-  // prefs.begin("robot", false);
-  // Kp = prefs.getFloat("kp", 50.0);
-  // Kd = prefs.getFloat("kd", 20.0);
-  // prefs.end();
-
   flag.setPeriodHertz(50);
   flag.attach(FLAG);
-
-  Serial.println("Setting up pins...1");
 
   pinMode(START, INPUT_PULLUP);
   pinMode(DIP1, INPUT_PULLUP);
   pinMode(DIP2, INPUT_PULLUP);
-
-  Serial.println("Setting up pins...2");
 
   for (int pin : tb_pins)
     pinMode(pin, OUTPUT);
@@ -100,7 +93,6 @@ void setup()
 
   delay(50);
 
-  Serial.println("Initializing sensors...");
   if (!init_sensor(sensor[0], 0x55, XSHUT1))
     while (1)
       ;
@@ -117,19 +109,17 @@ void setup()
     while (1)
       ;
 
-  Serial.println("Setting sensor settings...");
-  uint16_t roi[2] = {13, 4};
-  set_sensor_settings(sensor[0], Short, roi, 20, 20, threshold);
-  set_sensor_settings(sensor[1], Short, roi, 20, 20, threshold);
-  set_sensor_settings(sensor[2], Short, roi, 20, 20, threshold);
-  set_sensor_settings(sensor[3], Short, roi, 20, 20, threshold);
-  set_sensor_settings(sensor[4], Short, roi, 20, 20, threshold);
+  uint16_t roi[2] = {16, 7}; // 13x4
+  set_sensor_settings(sensor[0], Short, roi, 15, 15, threshold);
+  set_sensor_settings(sensor[1], Short, roi, 15, 15, threshold);
+  set_sensor_settings(sensor[2], Short, roi, 15, 15, threshold);
+  set_sensor_settings(sensor[3], Short, roi, 15, 15, threshold);
+  set_sensor_settings(sensor[4], Short, roi, 15, 15, threshold);
 
   // WAZNE INFO!
   // KLAIBRACJA ZAWSZE PO WLACZENIU ROBOTA, NIE TRZYMAC GO W RUCHU PRZEZ PIERWSZE ~3 SEKUNDY, BO INACZEJ ZROBI SIE OGROMNY GYRO BIAS I ROBOT BEDZIE SIE CIAGLE KRECIL W JEDNA STRONE!
   // POLOZYC NA RINGU, WLACZYC I DOPIERO PO ~3 SEKUNDACH COS USTAWIAC!
 
-  Serial.println("Initializing MPU6050...");
   if (mpu.begin(0x68))
   {
     mpu.setAccelerometerRange(MPU6050_RANGE_16_G);
@@ -151,7 +141,7 @@ void setup()
   gyroKp = prefs.getFloat("gkp", gyroKp);
   gyroKi = prefs.getFloat("gki", gyroKi);
   gyroKd = prefs.getFloat("gkd", gyroKd);
-  target_yaw = prefs.getFloat("targ", target_yaw);
+  target_yaw = prefs.getFloat("tyaw", target_yaw);
   threshold = prefs.getFloat("thres", threshold);
   base_speed = prefs.getFloat("base_speed", base_speed);
   prefs.end();
@@ -180,6 +170,7 @@ void setup()
 
 unsigned long targetTime = 0;
 unsigned long lastTime = 0;
+unsigned long panicTime = 0;
 
 void loop()
 {
@@ -203,7 +194,7 @@ void loop()
     yaw += rate * dt;
     yaw = fmod(yaw + 360.0f, 360.0f);
     to_target = fmod((target_yaw - yaw) + 540.0f, 360.0f) - 180.0f;
-    gyro_output = pid(to_target, dt, gyroKp, 0.0f, gyroKd, gyroPID, 1.0f, 1000.0f);
+    gyro_output = pid(to_target, dt, gyroKp, gyroKi, gyroKd, gyroPID, 1.0f, 1000.0f);
 
     if (abs(to_target) <= 5.0f)
     {
@@ -217,6 +208,9 @@ void loop()
     }
   }
 
+  if (target_reached)
+    en_gyro = false;
+
   if (!en_gyro || (!started && !web_started))
   {
     float num = 0.0f;
@@ -226,6 +220,7 @@ void loop()
     {
       sensor[i].GetResult(&results[i]);
       distances[i] = (results[i].Status == 0) ? results[i].Distance : threshold;
+      spads[i] = results[i].SigPerSPAD;
 
       if (distances[i] < threshold)
         sensor[i].ClearInterrupt();
@@ -244,9 +239,9 @@ void loop()
     error = (denom > 0.0001f) ? (num / denom) : 0.0f;
     output = pid(error, dt, Kp, Ki, Kd, drivePID, 1.0f, 1000.0f);
 
-    if (error < -0.01f)
+    if ((started) ? error < -0.01f : distances[0] < 100 || distances[1] < 100)
       last_seen = -1;
-    else if (error > 0.01f)
+    else if ((started) ? error > 0.01f : distances[3] < 100 || distances[4] < 100)
       last_seen = 1;
   }
 
@@ -255,32 +250,62 @@ void loop()
 
   if (started || web_started)
   {
-    // if (any_under_theshold1)
-    // {
-    //   left_speed = base_speed + output;
-    //   right_speed = base_speed - output;
-    // }
-    // else
-    // {
-    //   left_speed = base_speed * last_seen;
-    //   right_speed = base_speed * -last_seen;
-    // }
+    if (startup_done)
+    {
+      if (any_under_theshold1)
+      {
+        left_speed = base_speed + output;
+        right_speed = base_speed - output;
+      }
+      else
+      {
+        left_speed = base_speed * last_seen;
+        right_speed = base_speed * -last_seen;
+      }
+    }
+    else if (dip1)
+    {
+      // MODE 1 - DIP 1 NA GORZE
+      left_speed = 50;
+      right_speed = 50;
+    }
+    else
+    {
+      // MODE 2 - DIP 1 NA DOLE
+      left_speed = -gyro_output;
+      right_speed = gyro_output;
 
-    // if (!target_reached)
-    // {
-    left_speed = -gyro_output;
-    right_speed = gyro_output;
-    // }
+      if (target_reached)
+      {
+        weights_pos = 1;
+        servo_pos = 1;  
+        left_speed = base_speed + output;
+        right_speed = base_speed - output;
 
-    drive(left_speed, right_speed);
+        if (any_under_theshold2 || now - panicTime > 500)
+          startup_done = true;
+      }
+      else
+      {
+        panicTime = now;
+      }
+    }
   }
   else
   {
-    yaw = 0;
     weights_pos = 0;
+    servo_pos = 0;
+    yaw = 0;
     target_reached = false;
-    drive(0, 0);
+    startup_done = false;
+    en_gyro = true;
+    left_speed = 0;
+    right_speed = 0;
+    panicTime = now;
   }
 
+  drive(left_speed, right_speed);
+
   // Serial.printf("%.1fms\t%.1f°\t%d %d\t%d\t%d\t%d\t%d\t%d\t%.1f\n", dt * 1000, yaw, dip1, dip2, distances[0], distances[1], distances[2], distances[3], distances[4], error);
+  // Serial.printf("%d\t%d\t%d\t%d\t%d\n", spads[0], spads[1], spads[2], spads[3], spads[4]);
 }
