@@ -18,28 +18,33 @@ Adafruit_MPU6050 mpu;
 Preferences prefs;
 Servo flag;
 
-float yaw = 0.0f;
-float gyro_bias = 0.0f;
-unsigned long lastTime = 0;
+bool started = false;
+float web_started = false;
 
-const uint16_t threshold = 770;
-const uint16_t threshold2 = threshold - 150;
-const uint16_t threshold3 = 350;
+float yaw = 0.0f;
+float target_yaw = 0.0f;
+float gyro_bias = 0.0f;
+bool en_gyro = true;
+bool target_reached = false;
+
+float base_speed = 100;
 
 PIDState drivePID;
 float Kp = 50.0;
 float Ki = 0.0;
 float Kd = 20.0;
 
-float error, output;
+PIDState gyroPID;
+float gyroKp = 50.0;
+float gyroKi = 0.0;
+float gyroKd = 20.0;
 
-bool started = false;
-bool tornado = false;
-bool startup_done = false;
-int base_speed = 100;
+float threshold = 770;
+float threshold2 = threshold - 150;
+float threshold3 = 350;
+
+float error, output, left_speed, right_speed, to_target, gyro_output;
 int last_seen = 1;
-long start = 0;
-
 void calibrate_gyro_bias()
 {
   int samples = 200;
@@ -67,16 +72,12 @@ void setup()
   // Kd = prefs.getFloat("kd", 20.0);
   // prefs.end();
 
-  ESP32PWM::allocateTimer(0);
-  ESP32PWM::allocateTimer(1);
-  ESP32PWM::allocateTimer(2);
-  ESP32PWM::allocateTimer(3);
   flag.setPeriodHertz(50);
-  flag.attach(4);
+  flag.attach(FLAG);
 
   Serial.println("Setting up pins...1");
 
-  pinMode(14, INPUT_PULLUP);
+  pinMode(START, INPUT_PULLUP);
   pinMode(DIP1, INPUT_PULLUP);
   pinMode(DIP2, INPUT_PULLUP);
 
@@ -143,15 +144,42 @@ void setup()
 
   Serial.println("Done with setup!");
 
+  prefs.begin("robot", false);
+  Kp = prefs.getFloat("kp", Kp);
+  Ki = prefs.getFloat("ki", Ki);
+  Kd = prefs.getFloat("kd", Kd);
+  gyroKp = prefs.getFloat("gkp", gyroKp);
+  gyroKi = prefs.getFloat("gki", gyroKi);
+  gyroKd = prefs.getFloat("gkd", gyroKd);
+  target_yaw = prefs.getFloat("targ", target_yaw);
+  threshold = prefs.getFloat("thres", threshold);
+  base_speed = prefs.getFloat("base_speed", base_speed);
+  prefs.end();
+
   static TuningParam mySettings[] = {
+      {"ON/OFF", "st", &web_started, 0, 0, 0, TYPE_TOGGLE},
       {"PID Error", "err", &error, 0, 0, 0, TYPE_READONLY},
       {"PID Output", "out", &output, 0, 0, 0, TYPE_READONLY},
+      {"Threshold", "thres", &threshold, 0, 1000, 5, TYPE_ARROWS},
+      {"Base Speed", "base_speed", &base_speed, 0, 1000, 5, TYPE_ARROWS},
+      {"Drive Kp", "kp", &Kp, 0, 100, 0.5, TYPE_ARROWS},
+      {"Drive Ki", "ki", &Ki, 0, 100, 0.5, TYPE_ARROWS},
+      {"Drive Kd", "kd", &Kd, 0, 100, 0.5, TYPE_ARROWS},
+      {"Yaw", "yaw", &yaw, 0, 0, 0, TYPE_READONLY},
+      {"Target Yaw", "tyaw", &target_yaw, -180, 180, 1, TYPE_SLIDER},
+      {"Gyro Kp", "gkp", &gyroKp, 0, 100, 0.1, TYPE_ARROWS},
+      {"Gyro Ki", "gki", &gyroKi, 0, 100, 0.1, TYPE_ARROWS},
+      {"Gyro Kd", "gkd", &gyroKd, 0, 100, 0.05, TYPE_ARROWS},
 
   };
+
   startTuner(mySettings, sizeof(mySettings) / sizeof(mySettings[0]), results, SENSOR_COUNT, &prefs);
 
   weights(0, 0);
 }
+
+unsigned long targetTime = 0;
+unsigned long lastTime = 0;
 
 void loop()
 {
@@ -160,117 +188,97 @@ void loop()
   lastTime = now;
 
   started = digitalRead(START) == HIGH;
-
-  sensors_event_t a, g, temp;
-  mpu.getEvent(&a, &g, &temp);
-  float rate = (g.gyro.z - gyro_bias) * RAD_TO_DEG;
-  yaw += rate * dt;
-  yaw = fmod(yaw + 360.0f, 360.0f);
+  bool dip1 = !digitalRead(DIP1);
+  bool dip2 = !digitalRead(DIP2);
 
   bool any_under_theshold1 = false;
   bool any_under_theshold2 = false;
   bool any_under_theshold3 = false;
 
-  float num = 0.0f;
-  float denom = 0.0f;
-
-  for (int i = 0; i < SENSOR_COUNT; i++)
+  if (en_gyro)
   {
-    sensor[i].GetResult(&results[i]);
-    distances[i] = (results[i].Status == 0) ? results[i].Distance : threshold;
+    sensors_event_t a, g, temp;
+    mpu.getEvent(&a, &g, &temp);
+    float rate = (g.gyro.z - gyro_bias) * RAD_TO_DEG;
+    yaw += rate * dt;
+    yaw = fmod(yaw + 360.0f, 360.0f);
+    to_target = fmod((target_yaw - yaw) + 540.0f, 360.0f) - 180.0f;
+    gyro_output = pid(to_target, dt, gyroKp, 0.0f, gyroKd, gyroPID, 1.0f, 1000.0f);
 
-    if (distances[i] < threshold)
-      sensor[i].ClearInterrupt();
-    if (distances[i] < threshold)
-      any_under_theshold1 = true;
-    if (distances[i] < threshold2)
-      any_under_theshold2 = true;
-    if (distances[i] < threshold3)
-      any_under_theshold3 = true;
-
-    float s = 1.0f / (distances[i] + 0.000001f);
-    num += s * (i - 2);
-    denom += s;
+    if (abs(to_target) <= 5.0f)
+    {
+      if (millis() - targetTime >= 50)
+        target_reached = true;
+    }
+    else if (!target_reached)
+    {
+      targetTime = millis();
+      target_reached = false;
+    }
   }
-  error = (denom > 0.0001f) ? (num / denom) : 0.0f;
-  output = pid(error, dt, Kp, Ki, Kd, drivePID, 1.0f, 1000.0f);
 
-  bool dip1 = !digitalRead(DIP1);
-  bool dip2 = !digitalRead(DIP2);
+  if (!en_gyro || (!started && !web_started))
+  {
+    float num = 0.0f;
+    float denom = 0.0f;
 
-  if (error < -0.01f)
-    last_seen = -1;
-  else if (error > 0.01f)
-    last_seen = 1;
+    for (int i = 0; i < SENSOR_COUNT; i++)
+    {
+      sensor[i].GetResult(&results[i]);
+      distances[i] = (results[i].Status == 0) ? results[i].Distance : threshold;
+
+      if (distances[i] < threshold)
+        sensor[i].ClearInterrupt();
+      if (distances[i] < threshold)
+        any_under_theshold1 = true;
+      if (distances[i] < threshold2)
+        any_under_theshold2 = true;
+      if (distances[i] < threshold3)
+        any_under_theshold3 = true;
+
+      float s = 1.0f / (distances[i] + 0.000001f);
+      num += s * (i - 2);
+      denom += s;
+    }
+
+    error = (denom > 0.0001f) ? (num / denom) : 0.0f;
+    output = pid(error, dt, Kp, Ki, Kd, drivePID, 1.0f, 1000.0f);
+
+    if (error < -0.01f)
+      last_seen = -1;
+    else if (error > 0.01f)
+      last_seen = 1;
+  }
 
   handle_servo(now);
   handle_weights(now);
 
-  if (started)
+  if (started || web_started)
   {
-    if (any_under_theshold1)
-      servo_direction = 1;
+    // if (any_under_theshold1)
+    // {
+    //   left_speed = base_speed + output;
+    //   right_speed = base_speed - output;
+    // }
+    // else
+    // {
+    //   left_speed = base_speed * last_seen;
+    //   right_speed = base_speed * -last_seen;
+    // }
 
-    if (any_under_theshold2 || millis() - start > 767)
-      tornado = true;
+    // if (!target_reached)
+    // {
+    left_speed = -gyro_output;
+    right_speed = gyro_output;
+    // }
 
-    if (dip2 && distances[2] < 30)
-      weights_pos = 1;
-
-    if (distances[2] < 40 && startup_done)
-    {
-      base_speed = 100;
-      output = 0;
-    }
-    else if (any_under_theshold3 && startup_done)
-    {
-      base_speed = 35;
-    }
-    else if (any_under_theshold1 && startup_done)
-    {
-      base_speed = 100;
-    }
-    else if (tornado && startup_done)
-    {
-      base_speed = 0;
-      output = last_seen * 75;
-    }
-    else
-    {
-      if (dip1 && !startup_done)
-      {
-        if (last_seen == -1)
-          drive(-100, 100);
-        else if (last_seen == 1)
-          drive(100, -100);
-
-        servo_direction = 1;
-
-        delay((last_seen == -1) ? 220 : 110);
-
-        drive(100 - last_seen * 50, 100 + last_seen * 50);
-
-        delay(500);
-
-        startup_done = true;
-      }
-      else
-      {
-        tornado = true;
-        startup_done = true;
-      }
-    }
-
-    int speed_left = base_speed + output;
-    int speed_right = base_speed - output;
-    // drive(speed_left, speed_right);
+    drive(left_speed, right_speed);
   }
   else
   {
+    yaw = 0;
     weights_pos = 0;
-    tornado = false;
-    startup_done = false;
-    start = millis();
+    target_reached = false;
     drive(0, 0);
   }
 
