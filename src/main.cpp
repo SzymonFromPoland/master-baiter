@@ -24,11 +24,14 @@ float web_started = false;
 
 float yaw = 0.0f;
 float target_yaw = 0.0f;
+float arch_yaw = 0.0f;
 float gyro_bias = 0.0f;
 bool en_gyro = true;
 bool target_reached = false;
 
 float base_speed = 100;
+float arch_speed_in = 50;
+float arch_speed_out = 50;
 
 PIDState drivePID;
 float Kp = 50.0;
@@ -40,13 +43,19 @@ float gyroKp = 50.0;
 float gyroKi = 0.0;
 float gyroKd = 20.0;
 
-float threshold = 770;
-float threshold2 = threshold - 200;
+float threshold1 = 770;
+float threshold2 = 500;
 float threshold3 = 350;
 
 float error, output, left_speed, right_speed, to_target, gyro_output;
-int last_seen = 1;
+int last_dir = 1;
 bool startup_done = false;
+
+float emul_dip1 = false;
+float emul_dip2 = false;
+
+float ARCH_PANIC_TIME = 1000;
+float PANIC_TIME = 1000;
 
 void calibrate_gyro_bias()
 {
@@ -66,7 +75,6 @@ void calibrate_gyro_bias()
 void setup()
 {
   Serial.begin(115200);
-  delay(2500);
   Wire.begin(5, 6);
 
   flag.setPeriodHertz(50);
@@ -109,12 +117,12 @@ void setup()
     while (1)
       ;
 
-  uint16_t roi[2] = {16, 7}; // 13x4
-  set_sensor_settings(sensor[0], Short, roi, 15, 15, threshold);
-  set_sensor_settings(sensor[1], Short, roi, 15, 15, threshold);
-  set_sensor_settings(sensor[2], Short, roi, 15, 15, threshold);
-  set_sensor_settings(sensor[3], Short, roi, 15, 15, threshold);
-  set_sensor_settings(sensor[4], Short, roi, 15, 15, threshold);
+  uint16_t roi[2] = {13, 7}; // 13x4
+  set_sensor_settings(sensor[0], Short, roi, 15, 15, threshold1);
+  set_sensor_settings(sensor[1], Short, roi, 15, 15, threshold1);
+  set_sensor_settings(sensor[2], Short, roi, 15, 15, threshold1);
+  set_sensor_settings(sensor[3], Short, roi, 15, 15, threshold1);
+  set_sensor_settings(sensor[4], Short, roi, 15, 15, threshold1);
 
   // WAZNE INFO!
   // KLAIBRACJA ZAWSZE PO WLACZENIU ROBOTA, NIE TRZYMAC GO W RUCHU PRZEZ PIERWSZE ~3 SEKUNDY, BO INACZEJ ZROBI SIE OGROMNY GYRO BIAS I ROBOT BEDZIE SIE CIAGLE KRECIL W JEDNA STRONE!
@@ -142,21 +150,35 @@ void setup()
   gyroKi = prefs.getFloat("gki", gyroKi);
   gyroKd = prefs.getFloat("gkd", gyroKd);
   target_yaw = prefs.getFloat("tyaw", target_yaw);
-  threshold = prefs.getFloat("thres", threshold);
+  arch_yaw = prefs.getFloat("arch", arch_yaw);
+  threshold1 = prefs.getFloat("thres1", threshold1);
+  threshold2 = prefs.getFloat("thres2", threshold2);
   base_speed = prefs.getFloat("base_speed", base_speed);
+  arch_speed_in = prefs.getFloat("archsl", arch_speed_in);
+  arch_speed_out = prefs.getFloat("archsr", arch_speed_out);
+  PANIC_TIME = prefs.getFloat("panic", PANIC_TIME);
+  ARCH_PANIC_TIME = prefs.getFloat("archpanic", ARCH_PANIC_TIME);
   prefs.end();
 
   static TuningParam mySettings[] = {
       {"ON/OFF", "st", &web_started, 0, 0, 0, TYPE_TOGGLE},
+      {"Emul DIP1", "dip1", &emul_dip1, 0, 0, 0, TYPE_TOGGLE},
+      {"Emul DIP2", "dip2", &emul_dip2, 0, 0, 0, TYPE_TOGGLE},
       {"PID Error", "err", &error, 0, 0, 0, TYPE_READONLY},
       {"PID Output", "out", &output, 0, 0, 0, TYPE_READONLY},
-      {"Threshold", "thres", &threshold, 0, 1000, 5, TYPE_ARROWS},
+      {"Threshold 1", "thres1", &threshold1, 0, 1000, 5, TYPE_ARROWS},
+      {"Threshold 2", "thres2", &threshold2, 0, 1000, 5, TYPE_ARROWS},
       {"Base Speed", "base_speed", &base_speed, 0, 1000, 5, TYPE_ARROWS},
       {"Drive Kp", "kp", &Kp, 0, 100, 0.5, TYPE_ARROWS},
       {"Drive Ki", "ki", &Ki, 0, 100, 0.5, TYPE_ARROWS},
       {"Drive Kd", "kd", &Kd, 0, 100, 0.5, TYPE_ARROWS},
       {"Yaw", "yaw", &yaw, 0, 0, 0, TYPE_READONLY},
-      {"Target Yaw", "tyaw", &target_yaw, -180, 180, 1, TYPE_SLIDER},
+      {"Target Yaw", "tyaw", &target_yaw, -180, 180, 1, TYPE_ARROWS},
+      {"Arch Yaw", "arch", &arch_yaw, -180, 180, 1, TYPE_ARROWS},
+      {"Arch Left", "archsi", &arch_speed_in, 0, 100, 1, TYPE_ARROWS},
+      {"Arch Right", "archso", &arch_speed_out, 0, 100, 1, TYPE_ARROWS},
+      {"Arch Panic Time", "archpanic", &ARCH_PANIC_TIME, 0, 10000, 50, TYPE_ARROWS},
+      {"Panic Time", "panic", &PANIC_TIME, 0, 10000, 50, TYPE_ARROWS},
       {"Gyro Kp", "gkp", &gyroKp, 0, 100, 0.1, TYPE_ARROWS},
       {"Gyro Ki", "gki", &gyroKi, 0, 100, 0.1, TYPE_ARROWS},
       {"Gyro Kd", "gkd", &gyroKd, 0, 100, 0.05, TYPE_ARROWS},
@@ -179,8 +201,8 @@ void loop()
   lastTime = now;
 
   started = digitalRead(START) == HIGH;
-  bool dip1 = !digitalRead(DIP1);
-  bool dip2 = !digitalRead(DIP2);
+  bool dip1 = !digitalRead(DIP1) || emul_dip1;
+  bool dip2 = !digitalRead(DIP2) || emul_dip2;
 
   bool any_under_theshold1 = false;
   bool any_under_theshold2 = false;
@@ -193,7 +215,7 @@ void loop()
     float rate = (g.gyro.z - gyro_bias) * RAD_TO_DEG;
     yaw += rate * dt;
     yaw = fmod(yaw + 360.0f, 360.0f);
-    to_target = fmod((target_yaw - yaw) + 540.0f, 360.0f) - 180.0f;
+    to_target = fmod(((dip1 ? arch_yaw : target_yaw) * -last_dir - yaw) + 540.0f, 360.0f) - 180.0f;
     gyro_output = pid(to_target, dt, gyroKp, gyroKi, gyroKd, gyroPID, 1.0f, 1000.0f);
 
     if (abs(to_target) <= 5.0f)
@@ -219,12 +241,13 @@ void loop()
     for (int i = 0; i < SENSOR_COUNT; i++)
     {
       sensor[i].GetResult(&results[i]);
-      distances[i] = (results[i].Status == 0) ? results[i].Distance : threshold;
+      distances[i] = (results[i].Status == 0) ? min(results[i].Distance, (uint16_t)threshold1) : (uint16_t)threshold1;
       spads[i] = results[i].SigPerSPAD;
 
-      if (distances[i] < threshold)
+      if (distances[i] < threshold1)
         sensor[i].ClearInterrupt();
-      if (distances[i] < threshold)
+        
+      if (distances[i] < threshold1)
         any_under_theshold1 = true;
       if (distances[i] < threshold2)
         any_under_theshold2 = true;
@@ -238,18 +261,32 @@ void loop()
 
     error = (denom > 0.0001f) ? (num / denom) : 0.0f;
     output = pid(error, dt, Kp, Ki, Kd, drivePID, 1.0f, 1000.0f);
-
-    if ((started) ? error < -0.01f : distances[0] < 100 || distances[1] < 100)
-      last_seen = -1;
-    else if ((started) ? error > 0.01f : distances[3] < 100 || distances[4] < 100)
-      last_seen = 1;
   }
+
+  // Serial.printf("%d, %d, %d\n", any_under_theshold1, any_under_theshold2, any_under_theshold3);
+
+  if ((started) ? error < -0.01f : distances[0] < 100 || distances[1] < 100)
+    last_dir = -1;
+  else if ((started) ? error > 0.01f : distances[3] < 100 || distances[4] < 100)
+    last_dir = 1;
 
   handle_servo(now);
   handle_weights(now);
 
+  //TODO spowalnianie na blisko
+  //TODO wagi na przod w odpowiednim momencie
+  //TODO drive PID tuning
+  //TODO rampup 
+
   if (started || web_started)
   {
+    if (dip2)
+    {
+      startup_done = true;
+      en_gyro = false;
+      servo_pos = 1;
+    }
+
     if (startup_done)
     {
       if (any_under_theshold1)
@@ -259,15 +296,29 @@ void loop()
       }
       else
       {
-        left_speed = base_speed * last_seen;
-        right_speed = base_speed * -last_seen;
+        left_speed = base_speed * last_dir;
+        right_speed = base_speed * -last_dir;
       }
     }
     else if (dip1)
     {
       // MODE 1 - DIP 1 NA GORZE
-      left_speed = 50;
-      right_speed = 50;
+      left_speed = -gyro_output;
+      right_speed = gyro_output;
+
+      if (target_reached)
+      {
+        servo_pos = 1;
+        left_speed = (last_dir == 1) ? arch_speed_in : arch_speed_out;
+        right_speed = (last_dir == 1) ? arch_speed_out : arch_speed_in;
+
+        if ((any_under_theshold2 && now - panicTime > 500) || now - panicTime > (unsigned long)ARCH_PANIC_TIME)
+          startup_done = true;
+      }
+      else
+      {
+        panicTime = now;
+      }
     }
     else
     {
@@ -275,14 +326,16 @@ void loop()
       left_speed = -gyro_output;
       right_speed = gyro_output;
 
+      servo_pos = 1;
+
       if (target_reached)
       {
         weights_pos = 1;
-        servo_pos = 1;  
+        
         left_speed = base_speed + output;
         right_speed = base_speed - output;
 
-        if (any_under_theshold2 || now - panicTime > 500)
+        if ((any_under_theshold2 && now - panicTime > 100) || now - panicTime > (unsigned long)PANIC_TIME)
           startup_done = true;
       }
       else
@@ -298,6 +351,7 @@ void loop()
     yaw = 0;
     target_reached = false;
     startup_done = false;
+    servo_toggle = true;
     en_gyro = true;
     left_speed = 0;
     right_speed = 0;
