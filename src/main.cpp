@@ -45,7 +45,7 @@ float gyroKd = 20.0;
 
 float threshold1 = 770;
 float threshold2 = 500;
-float threshold3 = 350;
+float threshold3 = 100;
 
 float error, output, left_speed, right_speed, to_target, gyro_output;
 int last_dir = 1;
@@ -153,6 +153,7 @@ void setup()
   arch_yaw = prefs.getFloat("arch", arch_yaw);
   threshold1 = prefs.getFloat("thres1", threshold1);
   threshold2 = prefs.getFloat("thres2", threshold2);
+  threshold3 = prefs.getFloat("thres3", threshold3);
   base_speed = prefs.getFloat("base_speed", base_speed);
   arch_speed_in = prefs.getFloat("archsl", arch_speed_in);
   arch_speed_out = prefs.getFloat("archsr", arch_speed_out);
@@ -166,8 +167,9 @@ void setup()
       {"Emul DIP2", "dip2", &emul_dip2, 0, 0, 0, TYPE_TOGGLE},
       {"PID Error", "err", &error, 0, 0, 0, TYPE_READONLY},
       {"PID Output", "out", &output, 0, 0, 0, TYPE_READONLY},
-      {"Threshold 1", "thres1", &threshold1, 0, 1000, 5, TYPE_ARROWS},
-      {"Threshold 2", "thres2", &threshold2, 0, 1000, 5, TYPE_ARROWS},
+      {"Threshold normal", "thres1", &threshold1, 0, 1000, 5, TYPE_ARROWS},
+      {"Threshold trigger", "thres2", &threshold2, 0, 1000, 5, TYPE_ARROWS},
+      {"Threshold slow", "thres3", &threshold3, 0, 1000, 5, TYPE_ARROWS},
       {"Base Speed", "base_speed", &base_speed, 0, 1000, 5, TYPE_ARROWS},
       {"Drive Kp", "kp", &Kp, 0, 100, 0.5, TYPE_ARROWS},
       {"Drive Ki", "ki", &Ki, 0, 100, 0.5, TYPE_ARROWS},
@@ -193,6 +195,7 @@ void setup()
 unsigned long targetTime = 0;
 unsigned long lastTime = 0;
 unsigned long panicTime = 0;
+unsigned long slowTime = 0;
 
 void loop()
 {
@@ -246,7 +249,7 @@ void loop()
 
       if (distances[i] < threshold1)
         sensor[i].ClearInterrupt();
-        
+
       if (distances[i] < threshold1)
         any_under_theshold1 = true;
       if (distances[i] < threshold2)
@@ -273,10 +276,8 @@ void loop()
   handle_servo(now);
   handle_weights(now);
 
-  //TODO spowalnianie na blisko
-  //TODO wagi na przod w odpowiednim momencie
-  //TODO drive PID tuning
-  //TODO rampup 
+  // TODO wagi na przod w odpowiednim momencie
+  // TODO drive PID tuning
 
   if (started || web_started)
   {
@@ -285,14 +286,31 @@ void loop()
       startup_done = true;
       en_gyro = false;
       servo_pos = 1;
+      weights_pos = 1;
     }
 
     if (startup_done)
     {
+      weights_pos = 1;
       if (any_under_theshold1)
       {
-        left_speed = base_speed + output;
-        right_speed = base_speed - output;
+        if (any_under_theshold3)
+        {
+          left_speed = 30 + (output * 0.67f);
+          right_speed = 30 - (output * 0.67f);
+        }
+        else
+        {
+          slowTime = now;
+          left_speed = base_speed + output;
+          right_speed = base_speed - output;
+        }
+
+        if (now - slowTime > 500) {
+          weights_pos = 0;
+          left_speed = 100;
+          right_speed = 100;
+        }
       }
       else
       {
@@ -302,13 +320,14 @@ void loop()
     }
     else if (dip1)
     {
-      // MODE 1 - DIP 1 NA GORZE
+      // MODE 1 - DIP 1 NA GORZE (OBJEZDZANIE)
       left_speed = -gyro_output;
       right_speed = gyro_output;
 
+      servo_pos = 1;
+
       if (target_reached)
       {
-        servo_pos = 1;
         left_speed = (last_dir == 1) ? arch_speed_in : arch_speed_out;
         right_speed = (last_dir == 1) ? arch_speed_out : arch_speed_in;
 
@@ -322,7 +341,7 @@ void loop()
     }
     else
     {
-      // MODE 2 - DIP 1 NA DOLE
+      // MODE 2 - DIP 1 NA DOLE (KAT I PIZDA)
       left_speed = -gyro_output;
       right_speed = gyro_output;
 
@@ -331,7 +350,7 @@ void loop()
       if (target_reached)
       {
         weights_pos = 1;
-        
+
         left_speed = base_speed + output;
         right_speed = base_speed - output;
 
@@ -356,6 +375,7 @@ void loop()
     left_speed = 0;
     right_speed = 0;
     panicTime = now;
+    slowTime = now;
   }
 
   drive(left_speed, right_speed);
