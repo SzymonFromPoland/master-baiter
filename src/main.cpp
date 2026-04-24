@@ -75,7 +75,7 @@ void calibrate_gyro_bias()
 
 void setup()
 {
-  Serial.begin(115200);
+  // Serial.begin(115200);
   Wire.begin(5, 6);
 
   flag.setPeriodHertz(50);
@@ -289,10 +289,7 @@ void loop()
     if (dip2)
     {
       startup_done = true;
-      weights_pos = 1;
-
-      if (target_reached)
-        servo_pos = 1;
+      en_gyro = false;
     }
 
     if (startup_done)
@@ -300,6 +297,8 @@ void loop()
       weights_pos = 1;
       if (any_under_theshold1)
       {
+        servo_pos = 1;
+
         if (any_under_theshold3)
         {
           left_speed = 30 + (output * 0.67f);
