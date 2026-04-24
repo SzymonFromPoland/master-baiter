@@ -53,6 +53,7 @@ bool startup_done = false;
 
 float emul_dip1 = false;
 float emul_dip2 = false;
+float flags = true;
 
 float ARCH_PANIC_TIME = 1000;
 float PANIC_TIME = 1000;
@@ -157,14 +158,16 @@ void setup()
   base_speed = prefs.getFloat("base_speed", base_speed);
   arch_speed_in = prefs.getFloat("archsl", arch_speed_in);
   arch_speed_out = prefs.getFloat("archsr", arch_speed_out);
+  flags = prefs.getFloat("fl", flags);
   PANIC_TIME = prefs.getFloat("panic", PANIC_TIME);
   ARCH_PANIC_TIME = prefs.getFloat("archpanic", ARCH_PANIC_TIME);
   prefs.end();
 
   static TuningParam mySettings[] = {
-      {"ON/OFF", "st", &web_started, 0, 0, 0, TYPE_TOGGLE},
+      {"Robot ON/OFF", "st", &web_started, 0, 0, 0, TYPE_TOGGLE},
       {"Emul DIP1", "dip1", &emul_dip1, 0, 0, 0, TYPE_TOGGLE},
       {"Emul DIP2", "dip2", &emul_dip2, 0, 0, 0, TYPE_TOGGLE},
+      {"Flagi ON/OFF", "fl", &flags, 0, 0, 0, TYPE_TOGGLE},
       {"PID Error", "err", &error, 0, 0, 0, TYPE_READONLY},
       {"PID Output", "out", &output, 0, 0, 0, TYPE_READONLY},
       {"Threshold normal", "thres1", &threshold1, 0, 1000, 5, TYPE_ARROWS},
@@ -273,7 +276,9 @@ void loop()
   else if ((started) ? error > 0.01f : distances[3] < 100 || distances[4] < 100)
     last_dir = 1;
 
-  handle_servo(now);
+  if (flags)
+    handle_servo(now);
+
   handle_weights(now);
 
   // TODO wagi na przod w odpowiednim momencie
@@ -284,9 +289,10 @@ void loop()
     if (dip2)
     {
       startup_done = true;
-      en_gyro = false;
-      servo_pos = 1;
       weights_pos = 1;
+
+      if (target_reached)
+        servo_pos = 1;
     }
 
     if (startup_done)
@@ -306,7 +312,8 @@ void loop()
           right_speed = base_speed - output;
         }
 
-        if (now - slowTime > 500) {
+        if (now - slowTime > 500)
+        {
           weights_pos = 0;
           left_speed = 100;
           right_speed = 100;
@@ -324,10 +331,9 @@ void loop()
       left_speed = -gyro_output;
       right_speed = gyro_output;
 
-      servo_pos = 1;
-
       if (target_reached)
       {
+        servo_pos = 1;
         left_speed = (last_dir == 1) ? arch_speed_in : arch_speed_out;
         right_speed = (last_dir == 1) ? arch_speed_out : arch_speed_in;
 
@@ -345,10 +351,9 @@ void loop()
       left_speed = -gyro_output;
       right_speed = gyro_output;
 
-      servo_pos = 1;
-
       if (target_reached)
       {
+        servo_pos = 1;
         weights_pos = 1;
 
         left_speed = base_speed + output;
