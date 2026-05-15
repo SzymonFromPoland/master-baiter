@@ -12,5 +12,5 @@ extern const int tb_pins[10];
 #define XSHUT5 9
 #define DIP1 48
 #define DIP2 47
-#define START 14
+#define RCV 14
 #define FLAG 4

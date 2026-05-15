@@ -170,13 +170,13 @@ static void tunerTask(void *param)
   vTaskDelete(NULL);
 }
 
-void startTuner(TuningParam *params, int numParams, VL53L1X_Result_t *results, int numSensors, Preferences *prefs)
+void startTuner(TuningParam *params, int numParams, VL53L1X_Result_t *results, int numSensors, Preferences *prefs_global)
 {
   _params = params;
   _numParams = numParams;
   _results = results;
   _numSensors = numSensors;
-  _prefs = prefs;
+  _prefs = prefs_global;
 
   xTaskCreatePinnedToCore(tunerTask, "tuner", 16384, NULL, 1, NULL, 0);
 }

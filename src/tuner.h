@@ -25,6 +25,6 @@ struct TuningParam
     ParamType type;
 };
 
-void startTuner(TuningParam *params, int numParams, VL53L1X_Result_t *results, int numSensors, Preferences *prefs);
+void startTuner(TuningParam *params, int numParams, VL53L1X_Result_t *results, int numSensors, Preferences *prefs_global);
 
 #endif

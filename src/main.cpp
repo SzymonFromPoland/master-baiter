@@ -9,6 +9,7 @@
 #include <drive.h>
 #include <something.h>
 #include <config.h>
+#include <controller.h>
 
 VL53L1X_ULD sensor[SENSOR_COUNT];
 VL53L1X_Result_t results[SENSOR_COUNT];
@@ -16,9 +17,10 @@ uint16_t distances[SENSOR_COUNT];
 uint16_t spads[SENSOR_COUNT];
 
 Adafruit_MPU6050 mpu;
-Preferences prefs;
+Preferences prefs_global;
 Servo flag;
 
+bool delay_started = false;
 bool started = false;
 float web_started = false;
 
@@ -56,6 +58,8 @@ float emul_dip2 = false;
 
 float ARCH_PANIC_TIME = 1000;
 float PANIC_TIME = 1000;
+// float START_DELAY = 4900;
+float START_DELAY = 1000;
 
 void calibrate_gyro_bias()
 {
@@ -80,7 +84,8 @@ void setup()
   flag.setPeriodHertz(50);
   flag.attach(FLAG);
 
-  pinMode(START, INPUT_PULLUP);
+  startIRTask();
+
   pinMode(DIP1, INPUT_PULLUP);
   pinMode(DIP2, INPUT_PULLUP);
 
@@ -142,24 +147,24 @@ void setup()
 
   Serial.println("Done with setup!");
 
-  prefs.begin("robot", false);
-  Kp = prefs.getFloat("kp", Kp);
-  Ki = prefs.getFloat("ki", Ki);
-  Kd = prefs.getFloat("kd", Kd);
-  gyroKp = prefs.getFloat("gkp", gyroKp);
-  gyroKi = prefs.getFloat("gki", gyroKi);
-  gyroKd = prefs.getFloat("gkd", gyroKd);
-  target_yaw = prefs.getFloat("tyaw", target_yaw);
-  arch_yaw = prefs.getFloat("arch", arch_yaw);
-  threshold1 = prefs.getFloat("thres1", threshold1);
-  threshold2 = prefs.getFloat("thres2", threshold2);
-  threshold3 = prefs.getFloat("thres3", threshold3);
-  base_speed = prefs.getFloat("base_speed", base_speed);
-  arch_speed_in = prefs.getFloat("archsl", arch_speed_in);
-  arch_speed_out = prefs.getFloat("archsr", arch_speed_out);
-  PANIC_TIME = prefs.getFloat("panic", PANIC_TIME);
-  ARCH_PANIC_TIME = prefs.getFloat("archpanic", ARCH_PANIC_TIME);
-  prefs.end();
+  prefs_global.begin("robot", false);
+  Kp = prefs_global.getFloat("kp", Kp);
+  Ki = prefs_global.getFloat("ki", Ki);
+  Kd = prefs_global.getFloat("kd", Kd);
+  gyroKp = prefs_global.getFloat("gkp", gyroKp);
+  gyroKi = prefs_global.getFloat("gki", gyroKi);
+  gyroKd = prefs_global.getFloat("gkd", gyroKd);
+  target_yaw = prefs_global.getFloat("tyaw", target_yaw);
+  arch_yaw = prefs_global.getFloat("arch", arch_yaw);
+  threshold1 = prefs_global.getFloat("thres1", threshold1);
+  threshold2 = prefs_global.getFloat("thres2", threshold2);
+  threshold3 = prefs_global.getFloat("thres3", threshold3);
+  base_speed = prefs_global.getFloat("base_speed", base_speed);
+  arch_speed_in = prefs_global.getFloat("archsl", arch_speed_in);
+  arch_speed_out = prefs_global.getFloat("archsr", arch_speed_out);
+  PANIC_TIME = prefs_global.getFloat("panic", PANIC_TIME);
+  ARCH_PANIC_TIME = prefs_global.getFloat("archpanic", ARCH_PANIC_TIME);
+  prefs_global.end();
 
   static TuningParam mySettings[] = {
       {"ON/OFF", "st", &web_started, 0, 0, 0, TYPE_TOGGLE},
@@ -187,7 +192,7 @@ void setup()
 
   };
 
-  startTuner(mySettings, sizeof(mySettings) / sizeof(mySettings[0]), results, SENSOR_COUNT, &prefs);
+  startTuner(mySettings, sizeof(mySettings) / sizeof(mySettings[0]), results, SENSOR_COUNT, &prefs_global);
 
   weights(0, 0);
 }
@@ -196,6 +201,7 @@ unsigned long targetTime = 0;
 unsigned long lastTime = 0;
 unsigned long panicTime = 0;
 unsigned long slowTime = 0;
+unsigned long startTime = 0;
 
 void loop()
 {
@@ -203,7 +209,17 @@ void loop()
   float dt = (now - lastTime) / 1000.0;
   lastTime = now;
 
-  started = digitalRead(START) == HIGH;
+  if (delay_started)
+  {
+    if (millis() - startTime > START_DELAY)
+      started = true;
+  }
+  else
+  {
+    started = false;
+    startTime = millis();
+  }
+
   bool dip1 = !digitalRead(DIP1) || emul_dip1;
   bool dip2 = !digitalRead(DIP2) || emul_dip2;
 
@@ -275,8 +291,9 @@ void loop()
 
   handle_servo(now);
   handle_weights(now);
+  handle_ir();
 
-  // TODO wagi na przod w odpowiednim momencie
+  // TODO wagi na   przod w odpowiednim momencie
   // TODO drive PID tuning
 
   if (started || web_started)
@@ -306,7 +323,8 @@ void loop()
           right_speed = base_speed - output;
         }
 
-        if (now - slowTime > 500) {
+        if (now - slowTime > 500)
+        {
           weights_pos = 0;
           left_speed = 100;
           right_speed = 100;
