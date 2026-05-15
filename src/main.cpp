@@ -58,8 +58,8 @@ float emul_dip2 = false;
 
 float ARCH_PANIC_TIME = 1000;
 float PANIC_TIME = 1000;
-// float START_DELAY = 4900;
-float START_DELAY = 1000;
+float START_DELAY = 4900;
+// float START_DELAY = 1000;
 
 void calibrate_gyro_bias()
 {
@@ -160,8 +160,8 @@ void setup()
   threshold2 = prefs_global.getFloat("thres2", threshold2);
   threshold3 = prefs_global.getFloat("thres3", threshold3);
   base_speed = prefs_global.getFloat("base_speed", base_speed);
-  arch_speed_in = prefs_global.getFloat("archsl", arch_speed_in);
-  arch_speed_out = prefs_global.getFloat("archsr", arch_speed_out);
+  arch_speed_in = prefs_global.getFloat("archsi", arch_speed_in);
+  arch_speed_out = prefs_global.getFloat("archso", arch_speed_out);
   PANIC_TIME = prefs_global.getFloat("panic", PANIC_TIME);
   ARCH_PANIC_TIME = prefs_global.getFloat("archpanic", ARCH_PANIC_TIME);
   prefs_global.end();
