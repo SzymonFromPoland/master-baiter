@@ -11,6 +11,18 @@ void startIRTask()
   irrecv.enableIRIn();
 }
 
+void viggli_bogli(int n)
+{
+  for (int i = 0; i < n; i++)
+  {
+    flag.write(95 + 15);
+    delay(80);
+    flag.write(95 - 20);
+    delay(110);
+  }
+  flag.write(95);
+}
+
 void handle_ir()
 {
   if (!irrecv.decode(&irResults))
@@ -37,11 +49,15 @@ void handle_ir()
       STOP = command;
       prefs_global.putUInt("stop_address", STOP);
       prefs_global.putUInt("start_address", START);
+      viggli_bogli(3);
     }
     else if (address == 0x07)
     {
       if (command == START)
+      {
         delay_started = true;
+        viggli_bogli(1);
+      }
       else if (command == STOP)
         delay_started = false;
     }

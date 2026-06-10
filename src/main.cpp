@@ -58,7 +58,7 @@ float emul_dip2 = false;
 
 float ARCH_PANIC_TIME = 1000;
 float PANIC_TIME = 1000;
-float START_DELAY = 4900;
+float START_DELAY = 4900 - 200;
 // float START_DELAY = 1000;
 
 void calibrate_gyro_bias()
