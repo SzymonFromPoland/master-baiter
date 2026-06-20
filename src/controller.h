@@ -7,6 +7,7 @@
 extern Preferences prefs_global;
 extern Servo flag;
 extern bool delay_started;
+extern float digital_mode;
 
 void handle_ir();
 void startIRTask(); 

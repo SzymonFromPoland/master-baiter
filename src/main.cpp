@@ -55,6 +55,7 @@ bool startup_done = false;
 
 float emul_dip1 = false;
 float emul_dip2 = false;
+float digital_mode = false;
 
 float ARCH_PANIC_TIME = 1000;
 float PANIC_TIME = 1000;
@@ -164,10 +165,13 @@ void setup()
   arch_speed_out = prefs_global.getFloat("archso", arch_speed_out);
   PANIC_TIME = prefs_global.getFloat("panic", PANIC_TIME);
   ARCH_PANIC_TIME = prefs_global.getFloat("archpanic", ARCH_PANIC_TIME);
+  digital_mode = prefs_global.getFloat("digital_mode", digital_mode);
+
   prefs_global.end();
 
   static TuningParam mySettings[] = {
       {"ON/OFF", "st", &web_started, 0, 0, 0, TYPE_TOGGLE},
+      {"Digital Mode", "digital_mode", &digital_mode, 0, 0, 0, TYPE_TOGGLE},
       {"Emul DIP1", "dip1", &emul_dip1, 0, 0, 0, TYPE_TOGGLE},
       {"Emul DIP2", "dip2", &emul_dip2, 0, 0, 0, TYPE_TOGGLE},
       {"PID Error", "err", &error, 0, 0, 0, TYPE_READONLY},

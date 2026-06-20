@@ -6,9 +6,21 @@
 IRrecv irrecv(RCV);
 decode_results irResults;
 
+bool ir_en = false;
+bool tog1 = true;
+
 void startIRTask()
 {
-  irrecv.enableIRIn();
+  if (digital_mode)
+  {
+    pinMode(RCV, INPUT);
+    ir_en = false;
+  }
+  else
+  {
+    irrecv.enableIRIn();
+    ir_en = true;
+  }
 }
 
 void viggli_bogli(int n)
@@ -25,48 +37,73 @@ void viggli_bogli(int n)
 
 void handle_ir()
 {
-  if (!irrecv.decode(&irResults))
-    return;
-
-  uint8_t START, STOP;
-  prefs_global.begin("robot", false);
-  STOP = prefs_global.getUInt("stop_address", 0);
-  START = prefs_global.getUInt("start_address", 0);
-
-  switch (irResults.decode_type)
+  if (digital_mode)
   {
-  case RC5:
-  {
-    uint8_t address = (irResults.value >> 6) & 0x1F;
-    uint8_t command = irResults.value & 0x3F;
-    uint8_t toggle = (irResults.value >> 11) & 0x01;
-
-    Serial.printf("RC5 - Address: %u, Command: %u, Toggle: %u\n", address, command, toggle);
-
-    if (address == 0x0B)
+    if (ir_en)
     {
-      START = command + 1;
-      STOP = command;
-      prefs_global.putUInt("stop_address", STOP);
-      prefs_global.putUInt("start_address", START);
-      viggli_bogli(3);
+      irrecv.disableIRIn();
+      pinMode(RCV, INPUT);
+      delay(200);
+      ir_en = false;
     }
-    else if (address == 0x07)
+
+    delay_started = digitalRead(RCV);
+
+    if (delay_started && tog1)
     {
-      if (command == START)
+      viggli_bogli(1);
+      tog1 = false;
+    }
+    else if (!delay_started)
+    {
+      tog1 = true;
+    }
+  }
+  else
+  {
+    if (!irrecv.decode(&irResults))
+      return;
+
+    uint8_t START, STOP;
+    prefs_global.begin("robot", false);
+    STOP = prefs_global.getUInt("stop_address", 0);
+    START = prefs_global.getUInt("start_address", 0);
+
+    switch (irResults.decode_type)
+    {
+    case RC5:
+    {
+      uint8_t address = (irResults.value >> 6) & 0x1F;
+      uint8_t command = irResults.value & 0x3F;
+      uint8_t toggle = (irResults.value >> 11) & 0x01;
+
+      Serial.printf("RC5 - Address: %u, Command: %u, Toggle: %u\n", address, command, toggle);
+
+      if (address == 0x0B)
       {
-        delay_started = true;
-        viggli_bogli(1);
+        START = command + 1;
+        STOP = command;
+        prefs_global.putUInt("stop_address", STOP);
+        prefs_global.putUInt("start_address", START);
+        viggli_bogli(3);
       }
-      else if (command == STOP)
-        delay_started = false;
+      else if (address == 0x07)
+      {
+        if (command == START)
+        {
+          delay_started = true;
+          viggli_bogli(1);
+        }
+        else if (command == STOP)
+          delay_started = false;
+      }
+      break;
     }
-    break;
-  }
-  default:
-    break;
-  }
+    default:
+      break;
+    }
 
-  prefs_global.end();
-  irrecv.resume();
+    prefs_global.end();
+    irrecv.resume();
+  }
 }

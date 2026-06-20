@@ -33,7 +33,7 @@ static const char HTML_HEAD[] PROGMEM = R"HTML(<!DOCTYPE html><html><head>
   table { width: 100%; border-collapse: collapse; font-size: 11px; margin-top: 10px; }
   th, td { border: 1px solid #ddd; padding: 4px; text-align: center; }
 </style></head><body>
-<h2>Bomba-Pro Tuner</h2>
+<h2>Master Tuner</h2>
 <div id="controls" class="card"></div>
 <div class="card">
   <table><thead><tr><th>ID</th><th>Dist</th><th>Stat</th></tr></thead><tbody id="sensorBody"></tbody></table>
