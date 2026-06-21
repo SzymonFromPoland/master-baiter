@@ -61,6 +61,12 @@ void handle_ir()
   }
   else
   {
+    if (!ir_en)
+    {
+      irrecv.enableIRIn();
+      ir_en = true;
+    }
+
     if (!irrecv.decode(&irResults))
       return;
 

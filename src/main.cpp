@@ -57,10 +57,9 @@ float emul_dip1 = false;
 float emul_dip2 = false;
 float digital_mode = false;
 
-float ARCH_PANIC_TIME = 1000;
-float PANIC_TIME = 1000;
+float ARCH_PANIC_TIME = 500;
+float PANIC_TIME = 500;
 float START_DELAY = 4900 - 200;
-// float START_DELAY = 1000;
 
 void calibrate_gyro_bias()
 {
@@ -144,6 +143,11 @@ void setup()
 
     delay(200);
     calibrate_gyro_bias();
+  }
+  else
+  {
+    en_gyro = false;
+    Serial.println("MPU6050 not detected - gyro control disabled");
   }
 
   Serial.println("Done with setup!");
@@ -354,7 +358,10 @@ void loop()
         right_speed = (last_dir == 1) ? arch_speed_out : arch_speed_in;
 
         if ((any_under_theshold2 && now - panicTime > 500) || now - panicTime > (unsigned long)ARCH_PANIC_TIME)
+        {
+          last_dir = -last_dir;
           startup_done = true;
+        }
       }
       else
       {
