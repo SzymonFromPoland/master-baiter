@@ -35,7 +35,7 @@ const uint8_t xs_pins[5] = {
     10, // sensor 4
     9   // sensor 5
 };
-const uint8_t sensor_addresses[sensor_count] = {0x55, 0x60, 0x65, 0x70, 0x75};
+const uint8_t sensor_addresses[sensor_count] = {0x2A, 0x2C, 0x2E, 0x30, 0x32};
 
 VL53L1X_ULD sensors[sensor_count];
 VL53L1X_Result_t results[sensor_count];
@@ -50,9 +50,9 @@ Drive drive;
 
 float current_angle = 0.0f;
 float target_angle = 0.0f;
+float current_target_angle = 0.0f;
 bool target_reached = false;
-
-float base_speed = 100;
+float cheat_angle = 0.0f;
 
 float driveKp = 50.0;
 float driveKi = 0.0;
@@ -76,14 +76,15 @@ float arc_diff = 0.5f;
 float arc_speed = 0.0f;
 unsigned long arc_stop = 0;
 
+unsigned long panic_slow = 0;
+unsigned long panic_fast = 0;
+
 float current_speed = 0.0f;
 float fast_speed = 800.0f;
 float slow_speed = 500.0f;
 float spin_speed = 300.0f;
 float fast_up = 1000.0f;
-float fast_down = 1000.0f;
 float ang_up = 1000.0f;
-float slow_down = 1000.0f;
 
 float sensors_error = 0.0f;
 float raw_drive_pid_output = 0.0f;
@@ -102,7 +103,6 @@ int last_dir = 1;
 
 int mode = 1;
 int current_mode = 1;
-
 bool weights_en = true;
 
 uint8_t start_command = 0x00;
@@ -126,11 +126,13 @@ bool init_sensor(VL53L1X_ULD &sensor, uint8_t address, uint8_t xshut)
   digitalWrite(xshut, HIGH);
   delay(50);
   if (sensor.Begin(address) != VL53L1_ERROR_NONE)
-    return 0;
+    return false;
 
-  sensor.SetI2CAddress(address);
+  if (sensor.SetI2CAddress(address) != VL53L1_ERROR_NONE)
+    return false;
   delay(10);
-  return 1;
+
+  return true;
 }
 
 void set_sensor_settings(VL53L1X_ULD &sensor, EDistanceMode mode, uint16_t roi[2], uint16_t timing_budget, uint16_t inter_measurement, uint16_t threshold)
@@ -146,8 +148,7 @@ void set_sensor_settings(VL53L1X_ULD &sensor, EDistanceMode mode, uint16_t roi[2
 
 void setup()
 {
-  Serial.begin(115200);
-  Wire.begin(5, 6, 400000);
+  Wire.begin(5, 6, 300000);
 
   flag.begin(flag_pin, 95, 200);
 
@@ -165,7 +166,7 @@ void setup()
     digitalWrite(pin, LOW);
   }
 
-  uint16_t roi[2] = {13, 7}; // 13x4
+  uint16_t roi[2] = {13, 6}; // 13x4
 
   for (uint8_t i = 0; i < sensor_count; i++)
   {
@@ -174,10 +175,6 @@ void setup()
         ;
     set_sensor_settings(sensors[i], Short, roi, 15, 15, threshold1);
   }
-
-  // WAZNE INFO!
-  // KLAIBRACJA ZAWSZE PO WLACZENIU ROBOTA, NIE TRZYMAC GO W RUCHU PRZEZ PIERWSZE ~3 SEKUNDY, BO INACZEJ ZROBI SIE OGROMNY GYRO BIAS I ROBOT BEDZIE SIE CIAGLE KRECIL W JEDNA STRONE!
-  // POLOZYC NA RINGU, WLACZYC I DOPIERO PO ~3 SEKUNDACH COS USTAWIAC!
 
   if (mpu6050.begin())
   {
@@ -193,8 +190,10 @@ void setup()
   memory.begin("robot");
 
   current_mode = mode = memory.read_int("mode", mode);
-
   weights_en = memory.read_bool("weights_en", weights_en);
+
+  panic_slow = memory.read_ulong("panic_slow", panic_slow);
+  panic_fast = memory.read_ulong("panic_fast", panic_fast);
 
   arc_angle = memory.read_float("arc_angle", arc_angle);
   arc_diff = memory.read_float("arc_diff", arc_diff);
@@ -211,7 +210,8 @@ void setup()
   gyroKd = memory.read_float("gyroKd", gyroKd);
   gyroPID.setGains(gyroKp, gyroKi, gyroKd);
 
-  target_angle = memory.read_float("target_angle", target_angle);
+  current_target_angle = target_angle = memory.read_float("target_angle", target_angle);
+  cheat_angle = memory.read_float("cheat_angle", cheat_angle);
 
   threshold1 = memory.read_uint16("thres1", threshold1);
   threshold2 = memory.read_uint16("thres2", threshold2);
@@ -226,9 +226,7 @@ void setup()
   slow_speed = memory.read_float("slow_speed", slow_speed);
   spin_speed = memory.read_float("spin_speed", spin_speed);
   fast_up = memory.read_float("fast_up", fast_up);
-  fast_down = memory.read_float("fast_down", fast_down);
   ang_up = memory.read_float("slow_up", ang_up);
-  slow_down = memory.read_float("slow_down", slow_down);
 
   start_command = memory.read_uint8("start_comm");
   remote.set_start_command(start_command);
@@ -242,10 +240,14 @@ void setup()
                     { memory.write_int("mode", mode); });
   tuner.addButton("Calibrate mpu6050", []
                   { mpu6050.enable(); mpu6050.callibrate(); });
-
-  tuner.addCategory("Flag");
   tuner.addButton("Test flag", []
                   { flag.test(); });
+
+  tuner.addCategory("Safety");
+  tuner.addSlider("Panic slow [ ms ]", &panic_slow, 0UL, 10000UL, 100UL, [](unsigned long value)
+                  { memory.write_ulong("panic_slow", value); });
+  tuner.addSlider("Panic fast [ ms ]", &panic_fast, 0UL, 10000UL, 100UL, [](unsigned long value)
+                  { memory.write_ulong("panic_fast", value); });
 
   tuner.addCategory("Weights");
   tuner.addButton("Cycle weights poition", []
@@ -269,16 +271,18 @@ void setup()
 
   tuner.addCategory("Accelerometer");
   tuner.addSlider("Target", &target_angle, -180.0f, 180.0f, 5.0f, [](float value)
-                  { memory.write_float("target_angle", value); });
+                  { memory.write_float("target_angle", value); current_target_angle = target_angle; });
+  tuner.addSlider("Cheat angle", &cheat_angle, 0.0f, 360.0f, 5.0f, [](float value)
+                  { memory.write_float("cheat_angle", value); });
 
   tuner.addCategory("Arc");
-  tuner.addSlider("arc_ang", &arc_angle, -180.0f, 180.0f, 5.0f, [](float value)
+  tuner.addSlider("Arc angle", &arc_angle, -180.0f, 180.0f, 5.0f, [](float value)
                   { memory.write_float("arc_angle", value); });
-  tuner.addSlider("arc_diff", &arc_diff, 0.0f, 1024.0f, 5.0f, [](float value)
+  tuner.addSlider("Arc diff", &arc_diff, 0.0f, 1024.0f, 5.0f, [](float value)
                   { memory.write_float("arc_diff", value); });
-  tuner.addSlider("arc_speed", &arc_speed, 0.0f, 1023.0f, 1.0f, [](float value)
+  tuner.addSlider("Arc speed", &arc_speed, 0.0f, 1023.0f, 1.0f, [](float value)
                   { memory.write_float("arc_speed", value); });
-  tuner.addSlider("arc_stop_ms", &arc_stop, 0UL, 10000UL, 100UL, [](unsigned long value)
+  tuner.addSlider("Arc stop [ ms ]", &arc_stop, 0UL, 10000UL, 100UL, [](unsigned long value)
                   { memory.write_ulong("arc_stop", value); });
 
   tuner.addCategory("Motors Speeds");
@@ -290,12 +294,8 @@ void setup()
                   { memory.write_float("spin_speed", value); });
   tuner.addSlider("Fast ramp up (ms)", &fast_up, 0.0f, 10000.0f, 100.0f, [](float value)
                   { memory.write_float("fast_up", value); });
-  tuner.addSlider("Fast ramp down (ms)", &fast_down, 0.0f, 10000.0f, 10.0f, [](float value)
-                  { memory.write_float("fast_down", value); });
   tuner.addSlider("Slow ramp up (ms)", &ang_up, 0.0f, 10000.0f, 10.0f, [](float value)
                   { memory.write_float("slow_up", value); });
-  tuner.addSlider("Slow ramp down (ms)", &slow_down, 0.0f, 10000.0f, 10.0f, [](float value)
-                  { memory.write_float("slow_down", value); });
 
   tuner.addCategory("Motors PID");
   tuner.addSlider("Drive Kp", &driveKp, 0, 100, 0.1f, [](float value)
@@ -335,6 +335,9 @@ unsigned long TARGET_TIME = 0;
 unsigned long TURN_START_TIME = 0;
 unsigned long ARCH_PANIC_TIME = 0;
 unsigned long PANIC_TIME = 0;
+unsigned long IDLE_TIME = 0;
+
+const float sensorAngles[sensor_count] = {-50.0f, -24.0f, 0.0f, 24.0f, 50.0f};
 
 void loop()
 {
@@ -343,6 +346,7 @@ void loop()
 
   remote.handle();
   tuner.handle();
+
   const bool notificationBlocked = tuner.notificationActive();
   weight.handle(started && !notificationBlocked);
   flag.handle(started && !notificationBlocked);
@@ -353,7 +357,7 @@ void loop()
     float rate = -(mpu6050.get_gz() - mpu6050.get_bias()) * RAD_TO_DEG;
     current_angle += rate * dt;
     current_angle = fmod(current_angle + 360.0f, 360.0f);
-    gyro_error = fmod((target_angle - current_angle) + 540.0f, 360.0f) - 180.0f;
+    gyro_error = fmod((current_target_angle - current_angle) + 540.0f, 360.0f) - 180.0f;
 
     gyro_output = gyroPID.compute(gyro_error, dt);
 
@@ -396,7 +400,6 @@ void loop()
 
   if (sensors_en)
   {
-    static const float sensorAngles[sensor_count] = {-50.0f, -24.0f, 0.0f, 24.0f, 50.0f};
 
     float numerator = 0.0f;
     float denominator = 0.0f;
@@ -406,28 +409,33 @@ void loop()
     for (int i = 0; i < sensor_count; i++)
     {
       sensors[i].GetResult(&results[i]);
-      if (results[i].Status != 0 || results[i].Distance >= threshold1)
+
+      if (results[i].Status == 0)
+      {
+        results[i].Distance = min(results[i].Distance, threshold1);
+        smallest_distance = min(smallest_distance, (float)results[i].Distance);
+
+        if (results[i].Distance < threshold1)
+        {
+          sensors[i].ClearInterrupt();
+          target_detected = true;
+
+          const float s = 1.0f / max((float)results[i].Distance, 1.0f);
+          numerator += s * sensorAngles[i];
+          denominator += s;
+        }
+
+        if (results[i].Distance < threshold1)
+          any_under_theshold1 = true;
+        if (results[i].Distance < threshold2)
+          any_under_theshold2 = true;
+        if (results[i].Distance < threshold3)
+          any_under_theshold3 = true;
+      }
+      else
       {
         results[i].Distance = threshold1;
-        continue;
       }
-
-      smallest_distance = min(smallest_distance, (float)results[i].Distance);
-      target_detected = true;
-
-      const float s = 1.0f / max((float)results[i].Distance, 1.0f);
-      numerator += s * sensorAngles[i];
-      denominator += s;
-
-      if (results[i].Distance < threshold1)
-        sensors[i].ClearInterrupt();
-
-      if (results[i].Distance < threshold1)
-        any_under_theshold1 = true;
-      if (results[i].Distance < threshold2)
-        any_under_theshold2 = true;
-      if (results[i].Distance < threshold3)
-        any_under_theshold3 = true;
     }
 
     sensors_error = (denominator > 0.0001f) ? numerator / denominator : 0.0f;
@@ -459,17 +467,20 @@ void loop()
   }
   else
   {
+    current_target_angle = target_angle;
     current_mode = mode;
     target_reached = false;
     TURN_START_TIME = now;
     TARGET_TIME = now;
     PANIC_TIME = now;
     ARCH_PANIC_TIME = now;
+    IDLE_TIME = now - 4001000UL;
   }
 
   switch (current_mode)
   {
-  case 1:
+
+  case 1: // fast tornado
   {
     sensors_en = true;
     distance_strength = strength_fast;
@@ -494,8 +505,7 @@ void loop()
     }
     else
     {
-      const float speed_decrease = fast_down > 0.0f ? 1023.0f * dt * 1000.0f / fast_down : 1023.0f;
-      current_speed = constrain(current_speed - speed_decrease, spin_speed, 1023.0f);
+      current_speed = spin_speed;
       left_speed = last_dir * current_speed;
       right_speed = -last_dir * current_speed;
     }
@@ -503,13 +513,14 @@ void loop()
     break;
   }
 
-  case 2:
+  case 2: // slow tornado
   {
     sensors_en = true;
     distance_strength = strength_slow;
     mpu6050.disable();
     if (any_under_theshold3)
     {
+      current_speed = fast_speed;
       current_mode = 1;
     }
     else if (any_under_theshold1)
@@ -528,15 +539,16 @@ void loop()
     break;
   }
 
-  case 3:
-    if (started)
-      sensors_en = true;
-    else
+  case 3: // fast angle
+    if (started && !target_reached)
       sensors_en = false;
+    else
+      sensors_en = true;
 
     distance_strength = strength_fast;
     mpu6050.enable();
-    if (any_under_theshold1 && started)
+    current_target_angle = target_angle;
+    if ((any_under_theshold1 || now - PANIC_TIME > panic_fast * 1000UL) && started)
     {
       current_speed = fast_speed;
       current_mode = 1;
@@ -549,15 +561,16 @@ void loop()
     }
     break;
 
-  case 4:
-    if (started)
-      sensors_en = true;
-    else
+  case 4: // slow angle
+    if (started && !target_reached)
       sensors_en = false;
+    else
+      sensors_en = true;
 
     distance_strength = strength_fast;
     mpu6050.enable();
-    if (any_under_theshold1 && started)
+    current_target_angle = target_angle;
+    if ((any_under_theshold1 || now - PANIC_TIME > panic_slow * 1000UL) && started)
     {
       current_speed = slow_speed;
       current_mode = 2;
@@ -570,7 +583,7 @@ void loop()
     }
     break;
 
-  case 5:
+  case 5: // arc
     if (started && !target_reached)
       sensors_en = false;
     else
@@ -587,7 +600,7 @@ void loop()
     {
       if (target_reached)
       {
-        const int direction = target_angle < 0 ? 1 : -1;
+        const int direction = current_target_angle < 0 ? 1 : -1;
         last_dir = direction;
         current_speed = arc_speed;
         left_speed = current_speed + arc_diff * direction;
@@ -595,7 +608,7 @@ void loop()
       }
       else
       {
-        target_angle = arc_angle;
+        current_target_angle = arc_angle;
         current_speed = 0;
         left_speed = current_speed + gyro_output;
         right_speed = current_speed - gyro_output;
@@ -603,27 +616,69 @@ void loop()
     }
     break;
 
-  case 7:
+  case 6: // wait
+    if (started && !target_reached)
+      sensors_en = false;
+    else
+      sensors_en = true;
+
+    distance_strength = strength_fast;
+    mpu6050.enable();
+    if (any_under_theshold2 && started)
+    {
+      current_speed = fast_speed;
+      current_mode = 1;
+    }
+    else if (!target_reached)
+    {
+      current_speed = 0;
+      left_speed = current_speed + gyro_output;
+      right_speed = current_speed - gyro_output;
+
+      IDLE_TIME = now - 4001000UL;
+    }
+    else
+    {
+      const unsigned long elapsed = now - IDLE_TIME;
+
+      if (elapsed < 4000000UL)
+        current_speed = 0;
+      else if (elapsed < 4030000UL)
+        current_speed = slow_speed;
+      else
+      {
+        IDLE_TIME = now;
+        current_speed = 0;
+      }
+
+      left_speed = current_speed + drive_output;
+      right_speed = current_speed - drive_output;
+    }
+    break;
+
+  case 7: // cheat fast
     sensors_en = true;
+    mpu6050.enable();
     if (results[0].Distance < 40)
-      target_angle = -45;
+      current_target_angle = -cheat_angle;
     if (results[2].Distance < 40)
-      target_angle = 0;
+      current_target_angle = 0;
     if (results[4].Distance < 40)
-      target_angle = 45;
+      current_target_angle = cheat_angle;
 
     if (started)
       current_mode = 3;
     break;
 
-  case 8:
+  case 8: // cheat slow
     sensors_en = true;
+    mpu6050.enable();
     if (results[0].Distance < 40)
-      target_angle = -45;
+      current_target_angle = -cheat_angle;
     if (results[2].Distance < 40)
-      target_angle = 0;
+      current_target_angle = 0;
     if (results[4].Distance < 40)
-      target_angle = 45;
+      current_target_angle = cheat_angle;
 
     if (started)
       current_mode = 4;
@@ -655,7 +710,7 @@ void loop()
     tuner.printf("speed_right: %.1f\n\n", right_speed);
 
     tuner.printf("angle: %.1f\n", current_angle);
-    tuner.printf("target_angle: %.1f\n", target_angle);
+    tuner.printf("target_angle: %.1f\n", current_target_angle);
     tuner.printf("gyro_error: %.1f\n", gyro_error);
     tuner.printf("gyro_output: %.1f\n", gyro_output);
     tuner.printf("target_reached: %s\n\n", (target_reached) ? "true" : "false");
@@ -663,10 +718,10 @@ void loop()
     for (int s = 0; s < sensor_count; s++)
     {
       tuner.printf("distance[%d]: %u\n", s, results[s].Distance);
-      tuner.printf("status[%d]: %u\n", s, results[s].Status);
-      tuner.printf("ambient[%d]: %u\n", s, results[s].Ambient);
-      tuner.printf("sigperspad[%d]: %u\n", s, results[s].SigPerSPAD);
-      tuner.printf("numspad[%d]: %u\n\n", s, results[s].NumSPADs);
+      // tuner.printf("status[%d]: %u\n", s, results[s].Status);
+      // tuner.printf("ambient[%d]: %u\n", s, results[s].Ambient);
+      // tuner.printf("sigperspad[%d]: %u\n", s, results[s].SigPerSPAD);
+      // tuner.printf("numspad[%d]: %u\n\n", s, results[s].NumSPADs);
     }
   }
 }

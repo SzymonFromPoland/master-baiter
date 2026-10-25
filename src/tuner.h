@@ -215,9 +215,9 @@ private:
         ButtonCallback buttonCallback;
     };
 
-    static constexpr int MAX_PARAMETERS = 32;
-    static constexpr int DISPLAY_BUFFER_SIZE = 2048;
-    static constexpr int DISPLAY_PRINTF_BUFFER_SIZE = 256;
+    static constexpr int MAX_PARAMETERS = 128;
+    static constexpr int DISPLAY_BUFFER_SIZE = 4096;
+    static constexpr int DISPLAY_PRINTF_BUFFER_SIZE = 512;
 
     Parameter _parameters[MAX_PARAMETERS];
     int _parameterCount;
