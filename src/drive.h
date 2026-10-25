@@ -1,9 +1,11 @@
-#ifndef DRIVE_H
-#define DRIVE_H
-
+#pragma once
 #include <Arduino.h>
-#include <config.h>
 
-void drive(int speed_left, int speed_right);
+extern const uint8_t tb_pins[10];
 
-#endif
+class Drive
+{
+public:
+    void begin();
+    void setSpeed(int speed_left, int speed_right);
+};
