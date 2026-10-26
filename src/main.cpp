@@ -595,7 +595,7 @@ void loop()
 
     sensors_strength = strength_fast;
     mpu6050.enable();
-    if (((any_under_theshold1 && ARCH_PANIC_TIME > 400000UL) || now - ARCH_PANIC_TIME > arc_stop * 1000UL) && started)
+    if ((any_under_theshold2 || now - ARCH_PANIC_TIME > arc_stop * 1000UL) && started)
     {
       current_speed = fast_speed;
       current_mode = 1;
