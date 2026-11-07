@@ -3,8 +3,11 @@
 #include <Arduino.h>
 #include <WiFi.h>
 #include <WebServer.h>
+#include <Preferences.h>
 #include <stdarg.h>
 #include <initializer_list>
+
+class DataLogger;
 
 class WiFiTuner
 {
@@ -31,7 +34,31 @@ public:
     size_t printf(const char *format, ...);
     void clearDisplay();
 
+    void addTab(const char *name);
     void addCategory(const char *name);
+    // Adds a draggable circular control for a signed angle in [-180, 180].
+    void addAngle(
+        const char *name,
+        float *value,
+        FloatCallback onChange = nullptr);
+
+    // Displays selected log signals together on one timestamped, comma-separated line per sample.
+    bool addRaw(
+        const char *title,
+        DataLogger &logger,
+        std::initializer_list<const char *> signals);
+    // Adds selected logger columns as series on one shared chart, e.g. {"distance_0", "distance_1"}.
+    bool addChart(
+        const char *title,
+        DataLogger &logger,
+        std::initializer_list<const char *> signals);
+    // Sets a fixed shared Y-axis range instead of scaling to the observed samples.
+    bool addChart(
+        const char *title,
+        DataLogger &logger,
+        std::initializer_list<const char *> signals,
+        float minimum,
+        float maximum);
 
     void addSlider(
         const char *name,
@@ -141,10 +168,12 @@ public:
 
 private:
     WebServer _server;
+    Preferences _presetPreferences;
 
     enum ParameterType
     {
         SLIDER,
+        ANGLE,
         INT_SLIDER,
         UINT8_SLIDER,
         UINT16_SLIDER,
@@ -152,7 +181,9 @@ private:
         ULONG_SLIDER,
         DROPDOWN,
         BUTTON,
-        DISPLAY_TEXT
+        DISPLAY_TEXT,
+        LOG_CHART,
+        LOG_RAW
     };
 
     enum DropdownKind
@@ -169,7 +200,12 @@ private:
     struct Parameter
     {
         String name;
+        String tab;
         String category;
+        String logSeries;
+        bool hasChartBounds = false;
+        float chartMinimum = 0.0f;
+        float chartMaximum = 0.0f;
 
         ParameterType type;
 
@@ -215,26 +251,37 @@ private:
         ButtonCallback buttonCallback;
     };
 
-    static constexpr int MAX_PARAMETERS = 128;
+    static constexpr int MAX_PARAMETERS = 64;
     static constexpr int DISPLAY_BUFFER_SIZE = 4096;
     static constexpr int DISPLAY_PRINTF_BUFFER_SIZE = 512;
+    static constexpr uint8_t MAX_PRESETS = 32;
+    static constexpr uint8_t NO_PRESET = 0xFF;
+    static constexpr size_t MAX_PRESET_NAME_LENGTH = 32;
 
     Parameter _parameters[MAX_PARAMETERS];
     int _parameterCount;
 
     String _currentCategory;
+    String _currentTab;
     String _displayText;
+    DataLogger *_logSource;
     bool _hasDisplay;
     String _notificationMessage;
     unsigned long _notificationStartedUs;
     unsigned long _notificationDurationUs;
     bool _notificationActive;
+    bool _presetStorageReady;
 
     void handleRoot();
     void handleUpdate();
+    void handlePresetSave();
+    void handlePresetLoad();
+    void handlePresetDelete();
     void handleButton();
     void handleDisplay();
     void handleNotification();
+    void handleLogParse();
+    void handleLogClear();
 
     void appendDisplayText(const char *text);
 
@@ -246,7 +293,36 @@ private:
         std::initializer_list<const char *> labels,
         std::initializer_list<T> values);
 
-    double dropdownCurrentValue(const Parameter &parameter);
+    double dropdownCurrentValue(const Parameter &parameter) const;
+    bool setDropdownOption(Parameter &parameter, int optionIndex);
+    bool applyParameterValue(Parameter &parameter, double value);
+    bool isPresetParameter(const Parameter &parameter) const;
+    bool getPresetParameterValue(const Parameter &parameter, double &value) const;
+    bool isValidPresetValue(const Parameter &parameter, double value) const;
+    uint16_t presetParameterCount() const;
+    uint32_t presetSchemaHash() const;
+    String presetKey(uint8_t slot) const;
+    bool parsePresetSlot(const String &text, uint8_t &slot) const;
+    bool readPreset(
+        uint8_t slot,
+        String &name,
+        uint32_t &schemaHash,
+        double *values,
+        uint16_t &valueCount);
+    bool findPresetByName(const String &name, uint8_t &slot);
+    bool storePreset(const String &name, uint8_t &slot, int &statusCode, String &error);
+    bool applyPreset(uint8_t slot, bool remember, int &statusCode, String &error);
+    void restoreLastPreset();
+    String presetManagerHTML();
+
+    bool addLogView(
+        const char *title,
+        DataLogger &logger,
+        std::initializer_list<const char *> signals,
+        ParameterType type,
+        bool hasChartBounds = false,
+        float chartMinimum = 0.0f,
+        float chartMaximum = 0.0f);
 
     String generateHTML();
     String parameterHTML(const Parameter &parameter);
