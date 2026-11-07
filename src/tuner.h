@@ -24,7 +24,10 @@ public:
     WiFiTuner();
     ~WiFiTuner();
 
+    // Starts the tuner as an access point (default SSID: "Robot-Tuner").
     void begin(const char *ssid = "Robot-Tuner");
+    // Connects the tuner to an existing Wi-Fi network; falls back to the access point on failure.
+    void begin(const char *ssid, const char *password);
     void handle();
 
     void notify(const char *message, unsigned long durationUs);
@@ -271,7 +274,10 @@ private:
     unsigned long _notificationDurationUs;
     bool _notificationActive;
     bool _presetStorageReady;
+    bool _stationMode;
 
+    void initializePresetStorage();
+    void configureServer();
     void handleRoot();
     void handleUpdate();
     void handlePresetSave();

@@ -11,6 +11,7 @@ namespace
 constexpr uint32_t PRESET_MAGIC = 0x50525354;
 constexpr uint16_t PRESET_VERSION = 1;
 constexpr const char *PRESET_LAST_KEY = "last";
+constexpr unsigned long HOME_WIFI_CONNECT_TIMEOUT_MS = 15000;
 
 struct PresetStorageHeader
 {
@@ -65,7 +66,8 @@ WiFiTuner::WiFiTuner()
       _notificationStartedUs(0),
       _notificationDurationUs(0),
       _notificationActive(false),
-      _presetStorageReady(false)
+      _presetStorageReady(false),
+      _stationMode(false)
 {
 }
 
@@ -81,7 +83,7 @@ WiFiTuner::~WiFiTuner()
     }
 }
 
-void WiFiTuner::begin(const char *ssid)
+void WiFiTuner::initializePresetStorage()
 {
     if (!_presetStorageReady)
     {
@@ -91,10 +93,10 @@ void WiFiTuner::begin(const char *ssid)
         else
             Serial.println("[Tuner] Failed to open preset storage");
     }
+}
 
-    WiFi.mode(WIFI_AP);
-    WiFi.softAP(ssid, "0123456789");
-
+void WiFiTuner::configureServer()
+{
     _server.on("/", HTTP_GET, [this]()
                { handleRoot(); });
 
@@ -132,6 +134,17 @@ void WiFiTuner::begin(const char *ssid)
                { handleLogClear(); });
 
     _server.begin();
+}
+
+void WiFiTuner::begin(const char *ssid)
+{
+    initializePresetStorage();
+    _stationMode = false;
+    WiFi.mode(WIFI_AP);
+    if (!WiFi.softAP(ssid, "0123456789"))
+        Serial.println("[Tuner] Failed to start Wi-Fi access point");
+
+    configureServer();
 
     Serial.println();
     Serial.println("WiFi tuner started");
@@ -141,11 +154,56 @@ void WiFiTuner::begin(const char *ssid)
     Serial.println(WiFi.softAPIP());
 }
 
+void WiFiTuner::begin(const char *ssid, const char *password)
+{
+    initializePresetStorage();
+    _stationMode = false;
+
+    if (!ssid || !ssid[0])
+    {
+        Serial.println("[Tuner] Home Wi-Fi SSID is empty; starting access point instead");
+        begin();
+        return;
+    }
+
+    WiFi.mode(WIFI_STA);
+    WiFi.setAutoReconnect(true);
+    WiFi.begin(ssid, password ? password : "");
+
+    Serial.print("[Tuner] Connecting to Wi-Fi: ");
+    Serial.println(ssid);
+
+    const unsigned long startedAt = millis();
+    while (WiFi.status() != WL_CONNECTED &&
+           (unsigned long)(millis() - startedAt) < HOME_WIFI_CONNECT_TIMEOUT_MS)
+    {
+        delay(100);
+    }
+
+    if (WiFi.status() != WL_CONNECTED)
+    {
+        Serial.println("[Tuner] Could not connect to home Wi-Fi; starting access point instead");
+        WiFi.disconnect(true);
+        begin();
+        return;
+    }
+
+    _stationMode = true;
+    configureServer();
+
+    Serial.println();
+    Serial.println("WiFi tuner started");
+    Serial.print("Connected to SSID: ");
+    Serial.println(ssid);
+    Serial.print("IP: ");
+    Serial.println(WiFi.localIP());
+}
+
 void WiFiTuner::handle()
 {
     notificationActive();
 
-    if (WiFi.softAPgetStationNum() > 0)
+    if (_stationMode || WiFi.softAPgetStationNum() > 0)
         _server.handleClient();
 }
 

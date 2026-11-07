@@ -159,6 +159,9 @@ void set_sensor_settings(VL53L1X_ULD &sensor, EDistanceMode mode, uint16_t roi[2
 
 uint16_t roi[2] = {13, 6}; // 13x4
 
+const char *ssid = "TP-Link_B754";
+const char *password = "05368129";
+
 void setup()
 {
 
@@ -362,7 +365,7 @@ void setup()
   tuner.addSlider("Gyro Kd", &gyroKd, 0, 100, 0.1f, [](float value)
                   { gyroPID.setGains(gyroKp, gyroKi, gyroKd); memory.write_float("gyroKd", value); });
 
-  tuner.begin();
+  tuner.begin(ssid, password);
 
   remote.addPROGListener([](decode_results results)
                          { memory.write_uint8("start_comm", results.command + 1); memory.write_uint8("stop_comm", results.command); tuner.notify("Programmed", 2000000UL); });
