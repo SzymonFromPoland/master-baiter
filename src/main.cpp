@@ -258,13 +258,13 @@ void setup()
 
   data_logger.setSampleIntervalMs(10);
   data_logger.setMaxDurationMs(0);
-  // data_logger.add("sensors_error", &sensors_error);
-  // data_logger.add("signal_index", &signal_index);
-  // data_logger.add("signal_spad", &signal_spad);
-  // data_logger.add("distance", &distance);
-  // data_logger.add("gyro_error", &gyro_error);
-  // data_logger.add("left_speed", &left_speed);
-  // data_logger.add("right_speed", &right_speed);
+  data_logger.add("sensors_error", &sensors_error);
+  data_logger.add("signal_index", &signal_index);
+  data_logger.add("signal_spad", &signal_spad);
+  data_logger.add("distance", &distance);
+  data_logger.add("gyro_error", &gyro_error);
+  data_logger.add("left_speed", &left_speed);
+  data_logger.add("right_speed", &right_speed);
   data_logger.add("dt_ms", &dt_ms);
   data_logger.begin();
 
@@ -297,11 +297,11 @@ void setup()
 
   tuner.addTab("Logs");
   tuner.addCategory("Saved data");
-  // tuner.addChart("sensors_error", data_logger, {"sensors_error"}, -50.0f, 50.0f);
-  // tuner.addChart("gyro_error", data_logger, {"gyro_error"}, -1025.0f, 1025.0f);
-  // tuner.addChart("signal_index", data_logger, {"signal_index"}, 0, 400000000);
-  // tuner.addChart("signal_spad/distance", data_logger, {"signal_spad", "distance"}, 0.0f, 1.0f);
-  // tuner.addChart("motor_speeds", data_logger, {"left_speed", "right_speed"}, -1023.0f, 1023.0f);
+  tuner.addChart("sensors_error", data_logger, {"sensors_error"}, -50.0f, 50.0f);
+  tuner.addChart("gyro_error", data_logger, {"gyro_error"}, -1025.0f, 1025.0f);
+  tuner.addChart("signal_index", data_logger, {"signal_index"}, 0, 400000000);
+  tuner.addChart("signal_spad/distance", data_logger, {"signal_spad", "distance"}, 0.0f, 1.0f);
+  tuner.addChart("motor_speeds", data_logger, {"left_speed", "right_speed"}, -1023.0f, 1023.0f);
   tuner.addChart("dt_ms", data_logger, {"dt_ms"}, 0.0f, 100.0f);
   tuner.addCategory("Status");
   tuner.addDisplay("Live readings");
@@ -367,7 +367,7 @@ void setup()
   tuner.addSlider("Gyro Kd", &gyroKd, 0, 100, 0.1f, [](float value)
                   { gyroPID.setGains(gyroKp, gyroKi, gyroKd); memory.write_float("gyroKd", value); });
 
-  tuner.begin(ssid, password);
+  tuner.begin();
 
   remote.addPROGListener([](decode_results results)
                          { memory.write_uint8("start_comm", results.command + 1); memory.write_uint8("stop_comm", results.command); tuner.notify("Programmed", 2000000UL); });
@@ -440,7 +440,7 @@ void loop()
   if (mpu6050.calibrate_flag)
     sensors_en = false;
 
-  sensors_en = false;
+  // sensors_en = false;
   if (sensors_en)
   {
 
@@ -750,8 +750,7 @@ void loop()
   else
     drive.setSpeed(0, 0);
 
-  if (logging_en)
-    data_logger.update(started, millis());
+  data_logger.update(started, logging_en, millis());
 
   static unsigned long lastTunerUpdateUs = 0;
   if (now - lastTunerUpdateUs >= 100000UL && telemetry_en)

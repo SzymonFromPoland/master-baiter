@@ -2,14 +2,18 @@
 
 #include <LittleFS.h>
 #include <errno.h>
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
+static const char NO_SESSION_STATS_JSON[] =
+    "{\"hasSession\":false,\"bytesSaved\":0,\"flushCount\":0,\"signals\":{}}";
+
 constexpr size_t DataLogger::MAX_SIGNALS;
 constexpr size_t DataLogger::BUFFER_SIZE;
-constexpr uint32_t DataLogger::FLUSH_INTERVAL_MS;
 const char DataLogger::FILE_PATH[] = "/robot.csv";
+const char DataLogger::SESSION_STATS_FILE_PATH[] = "/robot_session.json";
 
 DataLogger::DataLogger()
     : _signalCount(0),
@@ -20,13 +24,15 @@ DataLogger::DataLogger()
       _elapsedRunStartedAt(0),
       _elapsedMs(0),
       _lastSampleAt(0),
-      _lastFlushAt(0),
+      _activeSessionBytesSaved(0),
+      _activeSessionFlushCount(0),
       _mounted(false),
       _schemaReady(false),
       _recordingFailed(false),
       _wasStarted(false),
       _recordingActive(false),
       _durationReached(false),
+      _lastSessionStatsJson(NO_SESSION_STATS_JSON),
       _status("Not initialized.")
 {
 }
@@ -171,15 +177,18 @@ bool DataLogger::begin()
     if (!restoreElapsedMs())
         return false;
 
+    if (!restoreLastSessionStats())
+        Serial.println("[DataLogger] Last-session statistics could not be restored.");
+
     _schemaReady = true;
     _recordingFailed = false;
     _pendingLength = 0;
-    _lastFlushAt = millis();
+    resetActiveSessionStats();
     _status = "Ready; waiting for started.";
     return true;
 }
 
-void DataLogger::update(bool started, uint32_t nowMs)
+void DataLogger::update(bool started, bool enabled, uint32_t nowMs)
 {
     if (!started)
     {
@@ -189,11 +198,27 @@ void DataLogger::update(bool started, uint32_t nowMs)
             _elapsedRunStartedAt = nowMs;
             _wasStarted = false;
             _recordingActive = false;
-            if (!_recordingFailed && !flushBuffer())
-                return;
-            _durationReached = false;
+            bool flushSucceeded = true;
             if (!_recordingFailed)
+                flushSucceeded = flushBuffer();
+
+            _lastSessionStatsJson = buildSessionStatsJson();
+            const bool statsSaved = saveLastSessionStats();
+            if (!statsSaved)
+                Serial.println("[DataLogger] Session data was saved, but its summary could not be stored.");
+
+            _durationReached = false;
+            if (!flushSucceeded || _recordingFailed)
+                return;
+
+            if (!statsSaved)
+            {
+                _status = "Session data saved, but its summary could not be stored.";
+            }
+            else
+            {
                 _status = "Ready; waiting for started.";
+            }
         }
         return;
     }
@@ -205,7 +230,8 @@ void DataLogger::update(bool started, uint32_t nowMs)
         _elapsedRunStartedAt = nowMs;
         _lastSampleAt = nowMs - _sampleIntervalMs;
         _durationReached = false;
-        _recordingActive = _mounted && _schemaReady && !_recordingFailed;
+        resetActiveSessionStats();
+        _recordingActive = enabled && _mounted && _schemaReady && !_recordingFailed;
         if (_recordingActive)
             _status = "Recording.";
     }
@@ -215,6 +241,19 @@ void DataLogger::update(bool started, uint32_t nowMs)
         _elapsedRunStartedAt = nowMs;
     }
 
+    if (!enabled)
+    {
+        _recordingActive = false;
+        return;
+    }
+
+    if (!_recordingActive && !_recordingFailed && !_durationReached &&
+        _mounted && _schemaReady)
+    {
+        _recordingActive = true;
+        _status = "Recording.";
+    }
+
     if (!_recordingActive || _recordingFailed)
         return;
 
@@ -222,8 +261,6 @@ void DataLogger::update(bool started, uint32_t nowMs)
     {
         _recordingActive = false;
         _durationReached = true;
-        if (!flushBuffer())
-            return;
         _status = "Maximum recording duration reached for this run.";
         return;
     }
@@ -234,14 +271,17 @@ void DataLogger::update(bool started, uint32_t nowMs)
     _lastSampleAt = nowMs;
     if (!appendSample(_elapsedMs))
         return;
-
-    if (_pendingLength >= BUFFER_SIZE / 2 ||
-        nowMs - _lastFlushAt >= FLUSH_INTERVAL_MS)
-        flushBuffer();
 }
 
 bool DataLogger::clear()
 {
+    if (_wasStarted)
+    {
+        _status = "Stop the robot before clearing logs.";
+        Serial.printf("[DataLogger] %s\n", _status.c_str());
+        return false;
+    }
+
     bool formatted = false;
     if (!_mounted)
     {
@@ -260,6 +300,14 @@ bool DataLogger::clear()
 
     const uint32_t nowMs = millis();
     _pendingLength = 0;
+    if (LittleFS.exists(SESSION_STATS_FILE_PATH) &&
+        !LittleFS.remove(SESSION_STATS_FILE_PATH))
+    {
+        setError("Could not remove the last-session summary; logs were not cleared.");
+        return false;
+    }
+
+    _lastSessionStatsJson = NO_SESSION_STATS_JSON;
     if (LittleFS.exists(FILE_PATH) && !LittleFS.remove(FILE_PATH))
     {
         setError("Could not remove the log file; logs were not cleared.");
@@ -278,11 +326,11 @@ bool DataLogger::clear()
 
     _schemaReady = true;
     _recordingFailed = false;
+    resetActiveSessionStats();
     _status = formatted ? "LittleFS formatted and logs cleared." : "Logs cleared.";
     _recordingActive = _wasStarted && !_durationReached;
     _elapsedMs = 0;
     _elapsedRunStartedAt = nowMs;
-    _lastFlushAt = nowMs;
     return true;
 }
 
@@ -309,6 +357,11 @@ File DataLogger::openRead() const
 const String &DataLogger::status() const
 {
     return _status;
+}
+
+const String &DataLogger::lastSessionStatsJson() const
+{
+    return _lastSessionStatsJson;
 }
 
 String DataLogger::header() const
@@ -372,6 +425,101 @@ bool DataLogger::restoreElapsedMs()
     return true;
 }
 
+bool DataLogger::restoreLastSessionStats()
+{
+    _lastSessionStatsJson = NO_SESSION_STATS_JSON;
+    if (!LittleFS.exists(SESSION_STATS_FILE_PATH))
+        return true;
+
+    File file = LittleFS.open(SESSION_STATS_FILE_PATH, FILE_READ);
+    if (!file)
+        return false;
+
+    const size_t size = file.size();
+    if (size == 0 || size > 4096)
+    {
+        file.close();
+        return false;
+    }
+
+    String savedStats = file.readString();
+    file.close();
+    if (savedStats.length() != size ||
+        !savedStats.startsWith("{\"hasSession\":true,\"bytesSaved\":") ||
+        !savedStats.endsWith("}") ||
+        savedStats.indexOf("\"flushCount\":") < 0 ||
+        savedStats.indexOf("\"signals\":{") < 0)
+    {
+        return false;
+    }
+
+    _lastSessionStatsJson = savedStats;
+    return true;
+}
+
+bool DataLogger::saveLastSessionStats() const
+{
+    File file = LittleFS.open(SESSION_STATS_FILE_PATH, FILE_WRITE);
+    if (!file)
+        return false;
+
+    const size_t length = _lastSessionStatsJson.length();
+    const size_t written = file.write(
+        reinterpret_cast<const uint8_t *>(_lastSessionStatsJson.c_str()),
+        length);
+    file.flush();
+    file.close();
+    return written == length;
+}
+
+String DataLogger::buildSessionStatsJson() const
+{
+    char summary[112];
+    snprintf(
+        summary,
+        sizeof(summary),
+        "{\"hasSession\":true,\"bytesSaved\":%llu,\"flushCount\":%u,\"signals\":{",
+        static_cast<unsigned long long>(_activeSessionBytesSaved),
+        static_cast<unsigned int>(_activeSessionFlushCount));
+
+    String result = summary;
+    for (size_t i = 0; i < _signalCount; ++i)
+    {
+        if (i > 0)
+            result += ',';
+        result += '"';
+        result += _signals[i].name;
+        result += "\":";
+
+        const SignalRange &range = _activeSessionRanges[i];
+        if (_activeSessionFlushCount == 0 || !range.hasSamples)
+        {
+            result += "null";
+            continue;
+        }
+
+        result += "{\"min\":";
+        result += String(range.minimum, 3);
+        result += ",\"max\":";
+        result += String(range.maximum, 3);
+        result += '}';
+    }
+    result += "}}";
+    return result;
+}
+
+void DataLogger::resetActiveSessionStats()
+{
+    _activeSessionBytesSaved = 0;
+    _activeSessionFlushCount = 0;
+    for (size_t i = 0; i < MAX_SIGNALS; ++i)
+    {
+        _activeSessionRanges[i].minimum = 0.0f;
+        _activeSessionRanges[i].maximum = 0.0f;
+        _activeSessionRanges[i].hasSamples = false;
+    }
+}
+
 bool DataLogger::writeHeader(File &file)
 {
     const String contents = header();
@@ -385,6 +533,7 @@ bool DataLogger::writeHeader(File &file)
 bool DataLogger::appendSample(uint64_t elapsedMs)
 {
     char row[512];
+    float sampleValues[MAX_SIGNALS];
     int length = snprintf(row, sizeof(row), "%llu", static_cast<unsigned long long>(elapsedMs));
     if (length < 0 || static_cast<size_t>(length) >= sizeof(row))
     {
@@ -395,11 +544,12 @@ bool DataLogger::appendSample(uint64_t elapsedMs)
     for (size_t i = 0; i < _signalCount; ++i)
     {
         const int remaining = static_cast<int>(sizeof(row) - static_cast<size_t>(length));
+        sampleValues[i] = _signals[i].callback(_signals[i].context);
         const int added = snprintf(
             row + length,
             static_cast<size_t>(remaining),
             ",%.3f",
-            _signals[i].callback(_signals[i].context));
+            sampleValues[i]);
         if (added < 0 || added >= remaining)
         {
             setError("A log sample exceeds the row buffer.");
@@ -415,18 +565,41 @@ bool DataLogger::appendSample(uint64_t elapsedMs)
     }
     row[length++] = '\n';
 
-    if (_pendingLength + static_cast<size_t>(length) > BUFFER_SIZE &&
-        !flushBuffer())
-        return false;
-
     if (static_cast<size_t>(length) > BUFFER_SIZE)
     {
         setError("A log sample exceeds the flash write buffer.");
         return false;
     }
 
-    memcpy(_pendingBuffer + _pendingLength, row, static_cast<size_t>(length));
-    _pendingLength += static_cast<size_t>(length);
+    const size_t sampleLength = static_cast<size_t>(length);
+    if (sampleLength > BUFFER_SIZE - _pendingLength && !flushBuffer())
+    {
+        return false;
+    }
+
+    memcpy(_pendingBuffer + _pendingLength, row, sampleLength);
+    _pendingLength += sampleLength;
+    for (size_t i = 0; i < _signalCount; ++i)
+    {
+        const float value = sampleValues[i];
+        if (!isfinite(value))
+            continue;
+
+        SignalRange &range = _activeSessionRanges[i];
+        if (!range.hasSamples)
+        {
+            range.minimum = value;
+            range.maximum = value;
+            range.hasSamples = true;
+        }
+        else
+        {
+            if (value < range.minimum)
+                range.minimum = value;
+            if (value > range.maximum)
+                range.maximum = value;
+        }
+    }
     return true;
 }
 
@@ -451,6 +624,7 @@ bool DataLogger::flushBuffer()
         _pendingLength);
     file.flush();
     file.close();
+    _activeSessionBytesSaved += written;
 
     if (written != _pendingLength)
     {
@@ -459,8 +633,8 @@ bool DataLogger::flushBuffer()
         return false;
     }
 
+    ++_activeSessionFlushCount;
     _pendingLength = 0;
-    _lastFlushAt = millis();
     return true;
 }
 

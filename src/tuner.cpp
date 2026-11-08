@@ -130,6 +130,9 @@ void WiFiTuner::configureServer()
     _server.on("/logs", HTTP_GET, [this]()
                { handleLogParse(); });
 
+    _server.on("/logs/stats", HTTP_GET, [this]()
+               { handleLogStats(); });
+
     _server.on("/logs/clear", HTTP_POST, [this]()
                { handleLogClear(); });
 
@@ -1832,6 +1835,18 @@ void WiFiTuner::handleLogParse()
     file.close();
 }
 
+void WiFiTuner::handleLogStats()
+{
+    if (!_logSource)
+    {
+        _server.send(404, "text/plain", "No log source is configured.");
+        return;
+    }
+
+    _server.sendHeader("Cache-Control", "no-store");
+    _server.send(200, "application/json", _logSource->lastSessionStatsJson());
+}
+
 void WiFiTuner::handleLogClear()
 {
     if (notificationActive())
@@ -1933,6 +1948,8 @@ String WiFiTuner::parameterHTML(const Parameter &p)
             html += p.logSeries;
             html += "' data-legend-id='loglegend";
             html += String(index);
+            html += "' data-session-stats-id='logstats";
+            html += String(index);
             html += "' data-range-id='logrange";
             html += String(index);
             html += "'";
@@ -1945,6 +1962,9 @@ String WiFiTuner::parameterHTML(const Parameter &p)
                 html += "'";
             }
             html += "></canvas>";
+            html += "<div class='chart-session-stats' id='logstats";
+            html += String(index);
+            html += "'>Parse saved data to load last-session min/max.</div>";
             html += "<div class='chart-legend' id='loglegend";
             html += String(index);
             html += "'></div>";
@@ -2444,6 +2464,11 @@ input[type=range]::-moz-range-thumb {
     color: #ff7777;
 }
 
+#lastSessionSummary {
+    flex-basis: 100%;
+    color: #bbb;
+}
+
 .log-chart {
     display: block;
     width: 100%;
@@ -2501,6 +2526,12 @@ input[type=range]::-moz-range-thumb {
     margin: 8px 0 12px;
     color: #bbb;
     font-size: 13px;
+}
+
+.chart-session-stats {
+    margin: 6px 0;
+    color: #bbb;
+    font-size: 12px;
 }
 
 .chart-legend-item {
@@ -2829,6 +2860,8 @@ function deletePreset() {
 
 let parsedLogHeaders = [];
 let parsedLogRows = [];
+let lastSessionStats = null;
+let lastSessionStatsError = '';
 let notificationRefreshFailed = false;
 const chartViewStates = new WeakMap();
 
@@ -2847,6 +2880,95 @@ function setLogStatus(message, isError) {
     if (!status) return;
     status.textContent = message;
     status.classList.toggle('error', isError);
+}
+
+function formatSessionBytes(bytes) {
+    const exactBytes = Math.round(bytes);
+    if (exactBytes < 1024) return exactBytes.toLocaleString() + ' bytes';
+    return exactBytes.toLocaleString() + ' bytes (' +
+        (exactBytes / 1024).toFixed(2) + ' KiB)';
+}
+
+function renderLastSessionSummary() {
+    const summary = document.getElementById('lastSessionSummary');
+    if (!summary) return;
+
+    if (!lastSessionStats) {
+        summary.textContent = lastSessionStatsError
+            ? 'Last-session statistics unavailable: ' + lastSessionStatsError
+            : 'Last-session statistics have not been loaded.';
+        return;
+    }
+    if (!lastSessionStats.hasSession) {
+        summary.textContent = 'No completed robot session is available.';
+        return;
+    }
+
+    const bytesSaved = Number(lastSessionStats.bytesSaved);
+    const flushCount = Number(lastSessionStats.flushCount);
+    summary.textContent = 'Last session: ' + formatSessionBytes(bytesSaved) +
+        ' of sample data saved; ' + flushCount + ' successful buffer ' +
+        (flushCount === 1 ? 'flush.' : 'flushes.');
+}
+
+function renderChartSessionStats(canvas) {
+    const summary = document.getElementById(canvas.dataset.sessionStatsId);
+    if (!summary) return;
+
+    if (!lastSessionStats) {
+        summary.textContent = lastSessionStatsError
+            ? 'Last-session min/max unavailable: ' + lastSessionStatsError
+            : 'Parse saved data to load last-session min/max.';
+        return;
+    }
+    if (!lastSessionStats.hasSession) {
+        summary.textContent = 'No completed robot session is available.';
+        return;
+    }
+
+    const signalRanges = lastSessionStats.signals || {};
+    const ranges = canvas.dataset.logSeries.split(',').filter(Boolean).map(name => {
+        const range = signalRanges[name];
+        if (!range || !Number.isFinite(Number(range.min)) ||
+            !Number.isFinite(Number(range.max))) {
+            return name + ': no saved samples';
+        }
+        return name + ': min ' + Number(range.min).toFixed(3) +
+            ', max ' + Number(range.max).toFixed(3);
+    });
+    summary.textContent = 'Last session - ' + ranges.join('; ');
+}
+
+function updateSessionStatsViews() {
+    renderLastSessionSummary();
+    document.querySelectorAll('canvas[data-session-stats-id]')
+        .forEach(renderChartSessionStats);
+}
+
+function refreshLastSessionStats() {
+    return fetch('/logs/stats', { cache: 'no-store' })
+        .then(response => response.text().then(text => {
+            if (!response.ok) throw new Error(text || response.statusText);
+            return JSON.parse(text);
+        }))
+        .then(stats => {
+            if (!stats || typeof stats.hasSession !== 'boolean' ||
+                !Number.isFinite(Number(stats.bytesSaved)) ||
+                !Number.isFinite(Number(stats.flushCount)) ||
+                !stats.signals || typeof stats.signals !== 'object') {
+                throw new Error('Invalid last-session statistics response.');
+            }
+            lastSessionStats = stats;
+            lastSessionStatsError = '';
+            updateSessionStatsViews();
+            return '';
+        })
+        .catch(error => {
+            lastSessionStats = null;
+            lastSessionStatsError = error.message;
+            updateSessionStatsViews();
+            return error.message;
+        });
 }
 
 function parseSavedLogs() {
@@ -2878,12 +3000,15 @@ function parseSavedLogs() {
             }
 
             resetLogChartViews();
-            const missing = renderLogViews();
-            let message = result.response.headers.get('X-Log-Status') || 'Saved data loaded.';
-            message += ' Parsed ' + parsedLogRows.length + ' samples.';
-            if (incompleteRows) message += ' Ignored ' + incompleteRows + ' incomplete rows.';
-            if (missing.length) message += ' Missing configured columns: ' + missing.join(', ') + '.';
-            setLogStatus(message, missing.length > 0);
+            return refreshLastSessionStats().then(statsError => {
+                const missing = renderLogViews();
+                let message = result.response.headers.get('X-Log-Status') || 'Saved data loaded.';
+                message += ' Parsed ' + parsedLogRows.length + ' samples.';
+                if (incompleteRows) message += ' Ignored ' + incompleteRows + ' incomplete rows.';
+                if (missing.length) message += ' Missing configured columns: ' + missing.join(', ') + '.';
+                if (statsError) message += ' Last-session statistics are unavailable.';
+                setLogStatus(message, missing.length > 0);
+            });
         })
         .catch(error => setLogStatus('Parse failed: ' + error.message, true));
 }
@@ -3077,6 +3202,7 @@ function renderLogViews() {
         setupChartInteractions(canvas);
         drawChart(canvas, available);
         renderChartLegend(canvas, available);
+        renderChartSessionStats(canvas);
     });
 
     document.querySelectorAll('pre[data-log-series]').forEach(view => {
@@ -3297,8 +3423,9 @@ function clearSavedLogs() {
             document.querySelectorAll('pre[data-log-series]').forEach(view => {
                 view.textContent = 'Press Parse saved data to load these signals.';
             });
-            setLogStatus(message, false);
+            return refreshLastSessionStats().then(() => message);
         })
+        .then(message => setLogStatus(message, false))
         .catch(error => setLogStatus('Clear failed: ' + error.message, true));
 }
 
@@ -3355,9 +3482,11 @@ function refreshDisplay() {
 
 setInterval(refreshDisplay, 250);
 setInterval(refreshNotification, 100);
+setInterval(refreshLastSessionStats, 1000);
 window.addEventListener('load', () => {
     refreshDisplay();
     refreshNotification();
+    refreshLastSessionStats();
     initializeAngleWheels();
     initializePresetManager();
 });
@@ -3449,6 +3578,7 @@ window.addEventListener('resize', () => {
             html += "<button class='button' type='button' onclick='parseSavedLogs()'>Parse saved data</button>";
             html += "<button class='button' type='button' onclick='clearSavedLogs()'>Clear flash data</button>";
             html += "<span id='logStatus'>Press Parse saved data to read the flash log.</span>";
+            html += "<span id='lastSessionSummary'>Loading last-session statistics...</span>";
             html += "</div>";
         }
 

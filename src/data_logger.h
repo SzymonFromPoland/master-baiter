@@ -35,13 +35,15 @@ public:
     void setMaxDurationMs(uint32_t durationMs);
 
     bool begin();
-    // Samples and elapsed time advance only while started; existing logs resume from their saved time.
-    void update(bool started, uint32_t nowMs);
+    // Samples are buffered while started, flushed when full, and flushed again after stopping.
+    void update(bool started, bool enabled, uint32_t nowMs);
     bool clear();
 
     bool hasSignal(const char *name) const;
     File openRead() const;
     const String &status() const;
+    // Returns the persisted JSON summary for the most recently completed run.
+    const String &lastSessionStatsJson() const;
 
 private:
     struct Signal
@@ -51,11 +53,19 @@ private:
         const void *context = nullptr;
     };
 
-    static constexpr size_t BUFFER_SIZE = 131072;
-    static constexpr uint32_t FLUSH_INTERVAL_MS = 1000;
+    struct SignalRange
+    {
+        float minimum = 0.0f;
+        float maximum = 0.0f;
+        bool hasSamples = false;
+    };
+
+    static constexpr size_t BUFFER_SIZE = 128 * 1024;
     static const char FILE_PATH[];
+    static const char SESSION_STATS_FILE_PATH[];
 
     Signal _signals[MAX_SIGNALS];
+    SignalRange _activeSessionRanges[MAX_SIGNALS];
     size_t _signalCount;
 
     char _pendingBuffer[BUFFER_SIZE];
@@ -66,7 +76,8 @@ private:
     uint32_t _elapsedRunStartedAt;
     uint64_t _elapsedMs;
     uint32_t _lastSampleAt;
-    uint32_t _lastFlushAt;
+    uint64_t _activeSessionBytesSaved;
+    uint32_t _activeSessionFlushCount;
 
     bool _mounted;
     bool _schemaReady;
@@ -75,10 +86,15 @@ private:
     bool _recordingActive;
     bool _durationReached;
 
+    String _lastSessionStatsJson;
     String _status;
 
     String header() const;
     bool restoreElapsedMs();
+    bool restoreLastSessionStats();
+    bool saveLastSessionStats() const;
+    String buildSessionStatsJson() const;
+    void resetActiveSessionStats();
     bool writeHeader(File &file);
     bool appendSample(uint64_t elapsedMs);
     bool flushBuffer();

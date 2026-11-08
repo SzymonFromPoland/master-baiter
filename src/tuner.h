@@ -287,6 +287,7 @@ private:
     void handleDisplay();
     void handleNotification();
     void handleLogParse();
+    void handleLogStats();
     void handleLogClear();
 
     void appendDisplayText(const char *text);
