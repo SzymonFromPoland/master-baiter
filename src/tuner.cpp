@@ -12,6 +12,8 @@ constexpr uint32_t PRESET_MAGIC = 0x50525354;
 constexpr uint16_t PRESET_VERSION = 1;
 constexpr const char *PRESET_LAST_KEY = "last";
 constexpr unsigned long HOME_WIFI_CONNECT_TIMEOUT_MS = 15000;
+constexpr UBaseType_t LIVE_LOG_QUEUE_LENGTH = 64;
+constexpr uint32_t LIVE_LOG_TASK_STACK_SIZE = 4096;
 
 struct PresetStorageHeader
 {
@@ -59,6 +61,10 @@ String escapeHtml(const String &value)
 
 WiFiTuner::WiFiTuner()
     : _server(80),
+      _liveServer(81),
+      _liveWebSocket("/live"),
+      _liveLogQueue(nullptr),
+      _liveLogTaskHandle(nullptr),
       _parameterCount(0),
       _currentTab("Main"),
       _logSource(nullptr),
@@ -127,16 +133,182 @@ void WiFiTuner::configureServer()
                    _server.send(200, "text/plain", "OK");
                });
 
-    _server.on("/logs", HTTP_GET, [this]()
-               { handleLogParse(); });
-
-    _server.on("/logs/stats", HTTP_GET, [this]()
-               { handleLogStats(); });
-
-    _server.on("/logs/clear", HTTP_POST, [this]()
-               { handleLogClear(); });
-
     _server.begin();
+    configureLiveServer();
+}
+
+void WiFiTuner::configureLiveServer()
+{
+    if (!_liveLogQueue)
+    {
+        _liveLogQueue = xQueueCreate(LIVE_LOG_QUEUE_LENGTH, sizeof(DataLogger::StreamFrame));
+        if (!_liveLogQueue)
+        {
+            Serial.println("[Tuner] Could not allocate the live log queue.");
+        }
+        else if (xTaskCreatePinnedToCore(
+                     liveLogTaskEntry,
+                     "live-log-stream",
+                     LIVE_LOG_TASK_STACK_SIZE,
+                     this,
+                     1,
+                     &_liveLogTaskHandle,
+                     0) != pdPASS)
+        {
+            vQueueDelete(_liveLogQueue);
+            _liveLogQueue = nullptr;
+            Serial.println("[Tuner] Could not start the live log task.");
+        }
+    }
+
+    _liveWebSocket.onEvent(
+        [this](AsyncWebSocket *, AsyncWebSocketClient *client, AwsEventType type, void *, uint8_t *, size_t)
+        {
+            if (type != WS_EVT_CONNECT)
+                return;
+
+            if (!_logSource)
+            {
+                client->close(1011, "No log source configured");
+                return;
+            }
+
+            String header = _logSource->header();
+            String schema = "{\"type\":\"schema\",\"header\":\"";
+            schema += header;
+            schema += "\"}";
+            client->text(schema);
+            if (!_liveLogQueue || !_liveLogTaskHandle)
+                client->text("{\"type\":\"error\",\"message\":\"Live log queue is unavailable.\"}");
+        });
+
+    _liveServer.addHandler(&_liveWebSocket);
+    _liveServer.begin();
+    Serial.println("[Tuner] Live log WebSocket listening on port 81.");
+}
+
+bool WiFiTuner::queueLogFrame(const DataLogger::StreamFrame &frame)
+{
+    if (!_liveLogQueue || _liveWebSocket.count() == 0)
+        return false;
+
+    return xQueueSend(_liveLogQueue, &frame, 0) == pdTRUE;
+}
+
+void WiFiTuner::liveLogTaskEntry(void *context)
+{
+    static_cast<WiFiTuner *>(context)->liveLogTask();
+}
+
+void WiFiTuner::liveLogTask()
+{
+    DataLogger::StreamFrame frame;
+    char message[1280];
+
+    for (;;)
+    {
+        if (!_liveLogQueue)
+        {
+            vTaskDelay(pdMS_TO_TICKS(100));
+            continue;
+        }
+
+        if (_liveWebSocket.count() == 0)
+        {
+            xQueueReset(_liveLogQueue);
+            _liveWebSocket.cleanupClients();
+            vTaskDelay(pdMS_TO_TICKS(100));
+            continue;
+        }
+
+        if (!_liveWebSocket.availableForWriteAll())
+        {
+            vTaskDelay(pdMS_TO_TICKS(5));
+            continue;
+        }
+
+        if (xQueueReceive(_liveLogQueue, &frame, pdMS_TO_TICKS(20)) != pdTRUE)
+        {
+            _liveWebSocket.cleanupClients();
+            continue;
+        }
+
+        int length = 0;
+        switch (frame.type)
+        {
+        case DataLogger::StreamFrame::Type::SessionStart:
+            length = snprintf(
+                message,
+                sizeof(message),
+                "{\"type\":\"start\",\"sessionId\":\"%s\"}",
+                frame.sessionId);
+            break;
+        case DataLogger::StreamFrame::Type::SessionStop:
+            length = snprintf(
+                message,
+                sizeof(message),
+                "{\"type\":\"stop\",\"sessionId\":\"%s\",\"samples\":%lu,\"droppedSamples\":%lu}",
+                frame.sessionId,
+                static_cast<unsigned long>(frame.sequence),
+                static_cast<unsigned long>(frame.droppedSamples));
+            break;
+        case DataLogger::StreamFrame::Type::Sample:
+            length = snprintf(
+                message,
+                sizeof(message),
+                "{\"type\":\"sample\",\"sessionId\":\"%s\",\"sequence\":%lu,\"elapsedMs\":%llu,\"values\":[",
+                frame.sessionId,
+                static_cast<unsigned long>(frame.sequence),
+                static_cast<unsigned long long>(frame.elapsedMs));
+            if (length < 0 || static_cast<size_t>(length) >= sizeof(message))
+                continue;
+
+            for (size_t i = 0; i < frame.signalCount && i < DataLogger::MAX_SIGNALS; ++i)
+            {
+                const int added = snprintf(
+                    message + length,
+                    sizeof(message) - static_cast<size_t>(length),
+                    "%s",
+                    i == 0 ? "" : ",");
+                if (added < 0 || static_cast<size_t>(added) >= sizeof(message) - static_cast<size_t>(length))
+                {
+                    length = -1;
+                    break;
+                }
+                length += added;
+
+                const int valueLength = isfinite(frame.values[i])
+                                            ? snprintf(
+                                                  message + length,
+                                                  sizeof(message) - static_cast<size_t>(length),
+                                                  "%.3f",
+                                                  static_cast<double>(frame.values[i]))
+                                            : snprintf(
+                                                  message + length,
+                                                  sizeof(message) - static_cast<size_t>(length),
+                                                  "null");
+                if (valueLength < 0 ||
+                    static_cast<size_t>(valueLength) >= sizeof(message) - static_cast<size_t>(length))
+                {
+                    length = -1;
+                    break;
+                }
+                length += valueLength;
+            }
+
+            if (length < 0)
+                continue;
+            if (static_cast<size_t>(length) + 2 >= sizeof(message))
+                continue;
+            message[length++] = ']';
+            message[length++] = '}';
+            message[length] = '\0';
+            break;
+        }
+
+        if (length > 0 && static_cast<size_t>(length) < sizeof(message))
+            _liveWebSocket.textAll(message, static_cast<size_t>(length));
+    }
 }
 
 void WiFiTuner::begin(const char *ssid)
@@ -1814,62 +1986,6 @@ void WiFiTuner::handleNotification()
         _server.send(200, "text/plain", "");
 }
 
-void WiFiTuner::handleLogParse()
-{
-    if (!_logSource)
-    {
-        _server.send(404, "text/plain", "No log source is configured.");
-        return;
-    }
-
-    File file = _logSource->openRead();
-    if (!file)
-    {
-        _server.send(503, "text/plain", _logSource->status());
-        return;
-    }
-
-    _server.sendHeader("Cache-Control", "no-store");
-    _server.sendHeader("X-Log-Status", _logSource->status());
-    _server.streamFile(file, "text/csv");
-    file.close();
-}
-
-void WiFiTuner::handleLogStats()
-{
-    if (!_logSource)
-    {
-        _server.send(404, "text/plain", "No log source is configured.");
-        return;
-    }
-
-    _server.sendHeader("Cache-Control", "no-store");
-    _server.send(200, "application/json", _logSource->lastSessionStatsJson());
-}
-
-void WiFiTuner::handleLogClear()
-{
-    if (notificationActive())
-    {
-        _server.send(423, "text/plain", "Controls are locked by an active notification");
-        return;
-    }
-
-    if (!_logSource)
-    {
-        _server.send(404, "text/plain", "No log source is configured.");
-        return;
-    }
-
-    if (!_logSource->clear())
-    {
-        _server.send(500, "text/plain", _logSource->status());
-        return;
-    }
-
-    _server.send(200, "text/plain", _logSource->status());
-}
-
 void WiFiTuner::appendDisplayText(const char *text)
 {
     if (!text || text[0] == '\0')
@@ -1939,7 +2055,7 @@ String WiFiTuner::parameterHTML(const Parameter &p)
             html += "', 'reset')\">Reset</button>";
             html += "<span class='chart-range' id='logrange";
             html += String(index);
-            html += "'>Parse saved data to enable chart navigation.</span>";
+            html += "'>Waiting for phone log data.</span>";
             html += "</div>";
             html += "<div class='chart-help'>Drag horizontally to pan. Hold Ctrl while scrolling to zoom.</div>";
             html += "<canvas class='log-chart' id='logview";
@@ -1964,7 +2080,7 @@ String WiFiTuner::parameterHTML(const Parameter &p)
             html += "></canvas>";
             html += "<div class='chart-session-stats' id='logstats";
             html += String(index);
-            html += "'>Parse saved data to load last-session min/max.</div>";
+            html += "'>Select a phone-saved session to view min/max.</div>";
             html += "<div class='chart-legend' id='loglegend";
             html += String(index);
             html += "'></div>";
@@ -1975,7 +2091,7 @@ String WiFiTuner::parameterHTML(const Parameter &p)
             html += String(index);
             html += "' data-log-series='";
             html += p.logSeries;
-            html += "'>Press Parse saved data to load these signals.</pre>";
+            html += "'>Waiting for phone-saved samples.</pre>";
         }
 
         html += "</div>";
@@ -2455,6 +2571,11 @@ input[type=range]::-moz-range-thumb {
     width: auto;
 }
 
+.log-toolbar select {
+    flex: 1 1 220px;
+    width: auto;
+}
+
 #logStatus {
     flex-basis: 100%;
     color: #bbb;
@@ -2858,21 +2979,41 @@ function deletePreset() {
         });
 }
 
+const PHONE_LOG_DB_NAME = 'robot-tuner-phone-logs';
+const PHONE_LOG_DB_VERSION = 1;
+const PHONE_LOG_BATCH_SIZE = 100;
+const MAX_PENDING_PHONE_SAMPLES = 20000;
+const MAX_CHART_ROWS = 12000;
 let parsedLogHeaders = [];
 let parsedLogRows = [];
 let lastSessionStats = null;
-let lastSessionStatsError = '';
+let phoneLogDatabase = null;
+let phoneSessions = new Map();
+let activeLogSessionId = null;
+let selectedLogSessionId = null;
+let loadingPhoneSessionId = null;
+let phoneSessionLoadGeneration = 0;
+let liveLogHeaders = [];
+let liveLogSocket = null;
+let pendingPhoneSamples = [];
+let phoneLogFlushPromise = null;
+let liveChartsDirty = false;
 let notificationRefreshFailed = false;
+const phoneTextEncoder = typeof TextEncoder === 'function' ? new TextEncoder() : null;
 const chartViewStates = new WeakMap();
+
+function utf8ByteLength(value) {
+    return phoneTextEncoder
+        ? phoneTextEncoder.encode(value).length
+        : new Blob([value]).size;
+}
 
 function showTab(tabId, button) {
     document.querySelectorAll('.tab-panel').forEach(panel => panel.classList.remove('active'));
     document.querySelectorAll('.tab-button').forEach(tabButton => tabButton.classList.remove('active'));
     document.getElementById(tabId).classList.add('active');
     button.classList.add('active');
-    if (parsedLogRows.length) {
-        renderLogViews();
-    }
+    if (parsedLogRows.length) renderLogViews();
 }
 
 function setLogStatus(message, isError) {
@@ -2892,41 +3033,28 @@ function formatSessionBytes(bytes) {
 function renderLastSessionSummary() {
     const summary = document.getElementById('lastSessionSummary');
     if (!summary) return;
-
     if (!lastSessionStats) {
-        summary.textContent = lastSessionStatsError
-            ? 'Last-session statistics unavailable: ' + lastSessionStatsError
-            : 'Last-session statistics have not been loaded.';
-        return;
-    }
-    if (!lastSessionStats.hasSession) {
-        summary.textContent = 'No completed robot session is available.';
+        summary.textContent = 'No phone-saved session selected.';
         return;
     }
 
-    const bytesSaved = Number(lastSessionStats.bytesSaved);
-    const flushCount = Number(lastSessionStats.flushCount);
-    summary.textContent = 'Last session: ' + formatSessionBytes(bytesSaved) +
-        ' of sample data saved; ' + flushCount + ' successful buffer ' +
-        (flushCount === 1 ? 'flush.' : 'flushes.');
+    const state = lastSessionStats.completed ? 'complete' : 'in progress';
+    summary.textContent = formatSessionBytes(lastSessionStats.bytesSaved || 0) +
+        ' saved on phone; ' + (lastSessionStats.sampleCount || 0) +
+        ' samples in ' + state + '; ' + (lastSessionStats.saveBatchCount || 0) +
+        ' phone save batches; ' + (lastSessionStats.missingSamples || 0) +
+        ' samples missing.';
 }
 
 function renderChartSessionStats(canvas) {
     const summary = document.getElementById(canvas.dataset.sessionStatsId);
     if (!summary) return;
-
     if (!lastSessionStats) {
-        summary.textContent = lastSessionStatsError
-            ? 'Last-session min/max unavailable: ' + lastSessionStatsError
-            : 'Parse saved data to load last-session min/max.';
-        return;
-    }
-    if (!lastSessionStats.hasSession) {
-        summary.textContent = 'No completed robot session is available.';
+        summary.textContent = 'Select a phone-saved session to view min/max.';
         return;
     }
 
-    const signalRanges = lastSessionStats.signals || {};
+    const signalRanges = lastSessionStats.minMax || {};
     const ranges = canvas.dataset.logSeries.split(',').filter(Boolean).map(name => {
         const range = signalRanges[name];
         if (!range || !Number.isFinite(Number(range.min)) ||
@@ -2936,7 +3064,7 @@ function renderChartSessionStats(canvas) {
         return name + ': min ' + Number(range.min).toFixed(3) +
             ', max ' + Number(range.max).toFixed(3);
     });
-    summary.textContent = 'Last session - ' + ranges.join('; ');
+    summary.textContent = 'Phone-saved session - ' + ranges.join('; ');
 }
 
 function updateSessionStatsViews() {
@@ -2945,72 +3073,555 @@ function updateSessionStatsViews() {
         .forEach(renderChartSessionStats);
 }
 
-function refreshLastSessionStats() {
-    return fetch('/logs/stats', { cache: 'no-store' })
-        .then(response => response.text().then(text => {
-            if (!response.ok) throw new Error(text || response.statusText);
-            return JSON.parse(text);
-        }))
-        .then(stats => {
-            if (!stats || typeof stats.hasSession !== 'boolean' ||
-                !Number.isFinite(Number(stats.bytesSaved)) ||
-                !Number.isFinite(Number(stats.flushCount)) ||
-                !stats.signals || typeof stats.signals !== 'object') {
-                throw new Error('Invalid last-session statistics response.');
+function openPhoneLogDatabase() {
+    return new Promise((resolve, reject) => {
+        const request = indexedDB.open(PHONE_LOG_DB_NAME, PHONE_LOG_DB_VERSION);
+        request.onupgradeneeded = () => {
+            const database = request.result;
+            if (!database.objectStoreNames.contains('sessions')) {
+                database.createObjectStore('sessions', { keyPath: 'id' });
             }
-            lastSessionStats = stats;
-            lastSessionStatsError = '';
-            updateSessionStatsViews();
-            return '';
-        })
-        .catch(error => {
-            lastSessionStats = null;
-            lastSessionStatsError = error.message;
-            updateSessionStatsViews();
-            return error.message;
-        });
+            if (!database.objectStoreNames.contains('samples')) {
+                const samples = database.createObjectStore(
+                    'samples',
+                    { keyPath: ['sessionId', 'sequence'] });
+                samples.createIndex('sessionId', 'sessionId', { unique: false });
+            }
+        };
+        request.onsuccess = () => resolve(request.result);
+        request.onerror = () => reject(request.error || new Error('Could not open phone log storage.'));
+        request.onblocked = () => reject(new Error('Phone log storage is blocked by another open page.'));
+    });
 }
 
-function parseSavedLogs() {
-    setLogStatus('Reading saved data from the robot...', false);
-    fetch('/logs', { cache: 'no-store' })
-        .then(response => response.text().then(text => {
-            if (!response.ok) throw new Error(text || response.statusText);
-            return { response, text };
-        }))
-        .then(result => {
-            const lines = result.text.split(/\r?\n/);
-            while (lines.length && lines[lines.length - 1] === '') lines.pop();
-            if (!lines.length) throw new Error('The saved log file is empty.');
+function copyPhoneSession(session) {
+    const copy = { ...session };
+    copy.headers = (session.headers || []).slice();
+    copy.minMax = {};
+    Object.keys(session.minMax || {}).forEach(name => {
+        const range = session.minMax[name];
+        copy.minMax[name] = range ? { min: range.min, max: range.max } : null;
+    });
+    return copy;
+}
 
-            parsedLogHeaders = lines[0].split(',');
-            if (parsedLogHeaders[0] !== 'elapsed_ms' && parsedLogHeaders[0] !== 'uptime_ms') {
-                throw new Error('Unsupported log file format.');
-            }
+function persistPhoneSession(session) {
+    if (!phoneLogDatabase) {
+        return Promise.reject(new Error('Phone log storage is not open.'));
+    }
+    return new Promise((resolve, reject) => {
+        const transaction = phoneLogDatabase.transaction('sessions', 'readwrite');
+        transaction.objectStore('sessions').put(copyPhoneSession(session));
+        transaction.oncomplete = () => resolve();
+        transaction.onerror = () => reject(transaction.error || new Error('Could not save phone session metadata.'));
+        transaction.onabort = () => reject(transaction.error || new Error('Saving phone session metadata was aborted.'));
+    });
+}
 
-            parsedLogRows = [];
-            let incompleteRows = 0;
-            for (let i = 1; i < lines.length; i++) {
-                const row = lines[i].split(',');
-                if (row.length !== parsedLogHeaders.length) {
-                    incompleteRows++;
-                    continue;
-                }
-                parsedLogRows.push(row);
-            }
+function renderPhoneSessionOptions() {
+    const select = document.getElementById('phoneLogSessions');
+    if (!select) return;
 
-            resetLogChartViews();
-            return refreshLastSessionStats().then(statsError => {
-                const missing = renderLogViews();
-                let message = result.response.headers.get('X-Log-Status') || 'Saved data loaded.';
-                message += ' Parsed ' + parsedLogRows.length + ' samples.';
-                if (incompleteRows) message += ' Ignored ' + incompleteRows + ' incomplete rows.';
-                if (missing.length) message += ' Missing configured columns: ' + missing.join(', ') + '.';
-                if (statsError) message += ' Last-session statistics are unavailable.';
-                setLogStatus(message, missing.length > 0);
+    const sessions = Array.from(phoneSessions.values())
+        .sort((left, right) => right.startedAt - left.startedAt);
+    select.textContent = '';
+    if (!sessions.length) {
+        const empty = document.createElement('option');
+        empty.value = '';
+        empty.textContent = 'No phone-saved sessions yet';
+        select.append(empty);
+        selectedLogSessionId = null;
+        return;
+    }
+
+    sessions.forEach(session => {
+        const option = document.createElement('option');
+        option.value = session.id;
+        const date = new Date(session.startedAt).toLocaleString();
+        option.textContent = date + ' - ' + session.sampleCount +
+            ' samples' + (session.completed ? '' : ' (incomplete)');
+        select.append(option);
+    });
+
+    if (!phoneSessions.has(selectedLogSessionId))
+        selectedLogSessionId = sessions[0].id;
+    select.value = selectedLogSessionId;
+}
+
+function loadPhoneSessionsFromDatabase() {
+    return new Promise((resolve, reject) => {
+        const transaction = phoneLogDatabase.transaction('sessions', 'readonly');
+        const request = transaction.objectStore('sessions').getAll();
+        request.onsuccess = () => {
+            request.result.forEach(session => {
+                const existing = phoneSessions.get(session.id);
+                if (!existing || session.sampleCount >= existing.sampleCount)
+                    phoneSessions.set(session.id, session);
             });
+        };
+        request.onerror = () => reject(request.error || new Error('Could not list phone-saved sessions.'));
+        transaction.oncomplete = () => {
+            renderPhoneSessionOptions();
+            resolve();
+        };
+        transaction.onerror = () => reject(transaction.error || new Error('Could not read phone-saved sessions.'));
+    });
+}
+
+function makePhoneSession(sessionId) {
+    const headerText = liveLogHeaders.join(',');
+    const minMax = {};
+    liveLogHeaders.slice(1).forEach(name => {
+        minMax[name] = null;
+    });
+    return {
+        id: sessionId,
+        startedAt: Date.now(),
+        endedAt: null,
+        completed: false,
+        headers: liveLogHeaders.slice(),
+        sampleCount: 0,
+        bytesSaved: utf8ByteLength(headerText + '\n'),
+        saveBatchCount: 0,
+        missingSamples: 0,
+        droppedSamples: 0,
+        lastSequence: 0,
+        receivedSequence: 0,
+        minMax
+    };
+}
+
+function getOrCreatePhoneSession(sessionId) {
+    let session = phoneSessions.get(sessionId);
+    if (session) return session;
+
+    session = makePhoneSession(sessionId);
+    phoneSessions.set(sessionId, session);
+    renderPhoneSessionOptions();
+    persistPhoneSession(session).catch(error =>
+        setLogStatus('Phone storage error: ' + error.message, true));
+    return session;
+}
+
+function activatePhoneSession(session) {
+    if (activeLogSessionId && activeLogSessionId !== session.id) {
+        const previous = phoneSessions.get(activeLogSessionId);
+        if (previous && !previous.completed) {
+            previous.interrupted = true;
+            persistPhoneSession(previous).catch(error =>
+                setLogStatus('Phone storage error: ' + error.message, true));
+        }
+    }
+
+    activeLogSessionId = session.id;
+    if (selectedLogSessionId !== session.id) {
+        selectedLogSessionId = session.id;
+        parsedLogHeaders = session.headers.slice();
+        parsedLogRows = [];
+        resetLogChartViews();
+    }
+
+    const select = document.getElementById('phoneLogSessions');
+    if (select) select.value = session.id;
+    lastSessionStats = session;
+    updateSessionStatsViews();
+    renderPhoneSessionOptions();
+    if (select) select.value = session.id;
+}
+
+function receiveSessionStart(message) {
+    if (typeof message.sessionId !== 'string' || !message.sessionId)
+        throw new Error('Robot sent an invalid session ID.');
+
+    const session = getOrCreatePhoneSession(message.sessionId);
+    session.completed = false;
+    session.endedAt = null;
+    session.interrupted = false;
+    if (session.receivedSequence === undefined)
+        session.receivedSequence = Number(session.lastSequence) || 0;
+    activatePhoneSession(session);
+    persistPhoneSession(session).catch(error =>
+        setLogStatus('Phone storage error: ' + error.message, true));
+    setLogStatus('Live stream connected; recording this run to phone storage.', false);
+}
+
+function appendLiveChartRow(session, row) {
+    if (selectedLogSessionId !== session.id || loadingPhoneSessionId === session.id) return;
+    parsedLogRows.push(row);
+    if (parsedLogRows.length > MAX_CHART_ROWS + 256) {
+        parsedLogRows.splice(0, parsedLogRows.length - MAX_CHART_ROWS);
+        resetLogChartViews();
+    }
+    liveChartsDirty = true;
+}
+
+function receiveLiveSample(message) {
+    if (typeof message.sessionId !== 'string' ||
+        !Number.isInteger(message.sequence) || message.sequence < 1 ||
+        !Number.isFinite(Number(message.elapsedMs)) ||
+        !Array.isArray(message.values) ||
+        message.values.length !== liveLogHeaders.length - 1) {
+        throw new Error('Robot sent an invalid live sample.');
+    }
+
+    const session = getOrCreatePhoneSession(message.sessionId);
+    if (activeLogSessionId !== session.id)
+        activatePhoneSession(session);
+
+    const sequence = Number(message.sequence);
+    const previousSequence = Number(session.receivedSequence || session.lastSequence || 0);
+    if (sequence <= previousSequence) return;
+    if (sequence > previousSequence + 1)
+        session.missingSamples += sequence - previousSequence - 1;
+    session.receivedSequence = sequence;
+
+    const values = message.values.map(value => {
+        if (value === null) return null;
+        const number = Number(value);
+        return Number.isFinite(number) ? number : null;
+    });
+    const row = [String(Math.round(Number(message.elapsedMs)))]
+        .concat(values.map(value => value === null ? 'NaN' : value.toFixed(3)));
+    const csvRow = row.join(',');
+    const bytes = utf8ByteLength(csvRow + '\n');
+    if (pendingPhoneSamples.length >= MAX_PENDING_PHONE_SAMPLES) {
+        session.missingSamples++;
+        session.droppedSamples++;
+        setLogStatus('Phone storage is behind the live stream; some samples are being dropped.', true);
+        return;
+    }
+
+    pendingPhoneSamples.push({
+        sessionId: session.id,
+        sequence,
+        row: csvRow,
+        values,
+        bytes
+    });
+    appendLiveChartRow(session, row);
+    if (pendingPhoneSamples.length >= PHONE_LOG_BATCH_SIZE) {
+        flushPhoneSamples().catch(error =>
+            setLogStatus('Phone storage write failed: ' + error.message, true));
+    }
+}
+
+function flushPhoneSamples() {
+    if (!phoneLogDatabase || !pendingPhoneSamples.length || loadingPhoneSessionId !== null)
+        return phoneLogFlushPromise || Promise.resolve();
+    if (phoneLogFlushPromise)
+        return phoneLogFlushPromise.then(() => flushPhoneSamples());
+
+    const batch = pendingPhoneSamples.splice(0, PHONE_LOG_BATCH_SIZE);
+    const updatedSessions = new Map();
+    batch.forEach(sample => {
+        let session = updatedSessions.get(sample.sessionId);
+        if (!session) {
+            const current = phoneSessions.get(sample.sessionId);
+            if (!current) return;
+            session = copyPhoneSession(current);
+            updatedSessions.set(sample.sessionId, session);
+        }
+
+        session.sampleCount++;
+        session.bytesSaved += sample.bytes;
+        session.lastSequence = sample.sequence;
+        sample.values.forEach((value, index) => {
+            if (value === null) return;
+            const name = session.headers[index + 1];
+            const range = session.minMax[name];
+            if (!range) {
+                session.minMax[name] = { min: value, max: value };
+            } else {
+                range.min = Math.min(range.min, value);
+                range.max = Math.max(range.max, value);
+            }
+        });
+    });
+    updatedSessions.forEach(session => { session.saveBatchCount++; });
+
+    const transactionPromise = new Promise((resolve, reject) => {
+        const transaction = phoneLogDatabase.transaction(['samples', 'sessions'], 'readwrite');
+        const samples = transaction.objectStore('samples');
+        const sessions = transaction.objectStore('sessions');
+        batch.forEach(sample => samples.put({
+            sessionId: sample.sessionId,
+            sequence: sample.sequence,
+            row: sample.row
+        }));
+        updatedSessions.forEach(session => sessions.put(copyPhoneSession(session)));
+
+        let settled = false;
+        const fail = error => {
+            if (settled) return;
+            settled = true;
+            phoneLogFlushPromise = null;
+            pendingPhoneSamples = batch.concat(pendingPhoneSamples);
+            reject(error || new Error('Saving samples to phone storage failed.'));
+        };
+        transaction.oncomplete = () => {
+            if (settled) return;
+            settled = true;
+            updatedSessions.forEach((session, sessionId) =>
+                phoneSessions.set(sessionId, session));
+            lastSessionStats = phoneSessions.get(selectedLogSessionId) || null;
+            updateSessionStatsViews();
+            renderPhoneSessionOptions();
+            const select = document.getElementById('phoneLogSessions');
+            if (select && selectedLogSessionId) select.value = selectedLogSessionId;
+            resolve();
+        };
+        transaction.onerror = () => fail(transaction.error);
+        transaction.onabort = () => fail(transaction.error);
+    });
+
+    phoneLogFlushPromise = transactionPromise;
+    return transactionPromise.then(() => {
+        phoneLogFlushPromise = null;
+        if (pendingPhoneSamples.length)
+            return flushPhoneSamples();
+    }, error => {
+        phoneLogFlushPromise = null;
+        throw error;
+    });
+}
+
+function receiveSessionStop(message) {
+    const session = phoneSessions.get(message.sessionId);
+    if (!session) return;
+    session.completed = true;
+    session.endedAt = Date.now();
+    session.droppedSamples = Math.max(
+        session.droppedSamples || 0,
+        Number(message.droppedSamples) || 0);
+    session.missingSamples = Math.max(
+        session.missingSamples || 0,
+        session.droppedSamples);
+    if (activeLogSessionId === session.id)
+        activeLogSessionId = null;
+
+    flushPhoneSamples()
+        .then(() => {
+            const savedSession = phoneSessions.get(session.id);
+            return savedSession ? persistPhoneSession(savedSession) : undefined;
         })
-        .catch(error => setLogStatus('Parse failed: ' + error.message, true));
+        .then(() => {
+            renderPhoneSessionOptions();
+            lastSessionStats = phoneSessions.get(selectedLogSessionId) || null;
+            updateSessionStatsViews();
+            setLogStatus(
+                'Run saved on phone. Robot-reported dropped samples: ' +
+                    session.droppedSamples + '.',
+                session.droppedSamples > 0 || session.missingSamples > 0);
+        })
+        .catch(error => setLogStatus('Phone storage write failed: ' + error.message, true));
+}
+
+function handleLiveLogMessage(event) {
+    try {
+        const message = JSON.parse(event.data);
+        if (message.type === 'schema') {
+            const columns = String(message.header || '').split(',');
+            if (columns.length < 2 || columns[0] !== 'elapsed_ms')
+                throw new Error('Robot sent an invalid log schema.');
+            liveLogHeaders = columns;
+            setLogStatus('Connected to robot; phone storage is ready.', false);
+        } else if (message.type === 'start') {
+            receiveSessionStart(message);
+        } else if (message.type === 'sample') {
+            receiveLiveSample(message);
+        } else if (message.type === 'stop') {
+            receiveSessionStop(message);
+        } else if (message.type === 'error') {
+            throw new Error(message.message || 'Live stream failed.');
+        }
+    } catch (error) {
+        setLogStatus('Live log error: ' + error.message, true);
+    }
+}
+
+function connectLiveLogSocket() {
+    const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
+    const socket = new WebSocket(protocol + '//' + location.hostname + ':81/live');
+    liveLogSocket = socket;
+    socket.onopen = () => setLogStatus('Connected to robot; waiting for a run.', false);
+    socket.onmessage = handleLiveLogMessage;
+    socket.onerror = () => setLogStatus('Live stream connection failed.', true);
+    socket.onclose = () => {
+        if (liveLogSocket !== socket) return;
+        setLogStatus('Live stream disconnected; reconnecting...', true);
+        window.setTimeout(connectLiveLogSocket, 1000);
+    };
+}
+
+function initializePhoneLogger() {
+    if (!window.indexedDB) {
+        setLogStatus('This phone browser does not support local log storage.', true);
+        return;
+    }
+
+    openPhoneLogDatabase()
+        .then(database => {
+            phoneLogDatabase = database;
+            return loadPhoneSessionsFromDatabase();
+        })
+        .then(() => {
+            if (selectedLogSessionId)
+                return loadPhoneSession(selectedLogSessionId);
+        })
+        .then(() => connectLiveLogSocket())
+        .catch(error => setLogStatus('Phone logger could not start: ' + error.message, true));
+}
+
+function loadSelectedPhoneSession() {
+    const select = document.getElementById('phoneLogSessions');
+    if (select && select.value)
+        loadPhoneSession(select.value)
+            .catch(error => setLogStatus('Could not load phone session: ' + error.message, true));
+}
+
+function loadPhoneSession(sessionId) {
+    return flushPhoneSamples().then(() => new Promise((resolve, reject) => {
+        const session = phoneSessions.get(sessionId);
+        if (!session || !phoneLogDatabase) {
+            reject(new Error('Phone-saved session not found.'));
+            return;
+        }
+
+        const loadGeneration = ++phoneSessionLoadGeneration;
+        selectedLogSessionId = sessionId;
+        parsedLogHeaders = session.headers.slice();
+        parsedLogRows = [];
+        loadingPhoneSessionId = sessionId;
+        lastSessionStats = session;
+        resetLogChartViews();
+        updateSessionStatsViews();
+
+        const stride = Math.max(1, Math.ceil(session.sampleCount / MAX_CHART_ROWS));
+        let visited = 0;
+        let lastRow = null;
+        const loadedRows = [];
+        const transaction = phoneLogDatabase.transaction('samples', 'readonly');
+        const request = transaction.objectStore('samples')
+            .index('sessionId').openCursor(IDBKeyRange.only(sessionId));
+        request.onsuccess = () => {
+            const cursor = request.result;
+            if (!cursor) return;
+            lastRow = cursor.value.row;
+            if (visited % stride === 0)
+                loadedRows.push(lastRow.split(','));
+            visited++;
+            cursor.continue();
+        };
+        request.onerror = () => {
+            if (loadingPhoneSessionId === sessionId) loadingPhoneSessionId = null;
+            reject(request.error || new Error('Could not read saved samples.'));
+        };
+        transaction.oncomplete = () => {
+            if (loadingPhoneSessionId === sessionId) loadingPhoneSessionId = null;
+            if (loadGeneration !== phoneSessionLoadGeneration || selectedLogSessionId !== sessionId) {
+                resolve();
+                return;
+            }
+            parsedLogRows = loadedRows;
+            if (lastRow && visited > 0 &&
+                parsedLogRows[parsedLogRows.length - 1].join(',') !== lastRow) {
+                parsedLogRows.push(lastRow.split(','));
+            }
+            pendingPhoneSamples
+                .filter(sample => sample.sessionId === sessionId)
+                .forEach(sample => appendLiveChartRow(session, sample.row.split(',')));
+            resetLogChartViews();
+            renderLogViews();
+            renderLastSessionSummary();
+            const select = document.getElementById('phoneLogSessions');
+            if (select) select.value = sessionId;
+            setLogStatus(
+                (session.completed ? 'Loaded phone-saved run. ' : 'Loaded in-progress phone run. ') +
+                    parsedLogRows.length + ' chart points shown.',
+                false);
+            resolve();
+        };
+        transaction.onerror = () => {
+            if (loadingPhoneSessionId === sessionId) loadingPhoneSessionId = null;
+            reject(transaction.error || new Error('Could not load saved phone samples.'));
+        };
+        transaction.onabort = () => {
+            if (loadingPhoneSessionId === sessionId) loadingPhoneSessionId = null;
+            reject(transaction.error || new Error('Loading phone samples was aborted.'));
+        };
+    }));
+}
+
+function downloadSelectedSession() {
+    if (!selectedLogSessionId) {
+        setLogStatus('Select a phone-saved session to download.', true);
+        return;
+    }
+
+    flushPhoneSamples()
+        .then(() => new Promise((resolve, reject) => {
+            const session = phoneSessions.get(selectedLogSessionId);
+            if (!session) {
+                reject(new Error('Phone-saved session not found.'));
+                return;
+            }
+
+            const parts = [session.headers.join(',') + '\n'];
+            const transaction = phoneLogDatabase.transaction('samples', 'readonly');
+            const request = transaction.objectStore('samples')
+                .index('sessionId').openCursor(IDBKeyRange.only(session.id));
+            request.onsuccess = () => {
+                const cursor = request.result;
+                if (!cursor) return;
+                parts.push(cursor.value.row + '\n');
+                cursor.continue();
+            };
+            request.onerror = () => reject(request.error || new Error('Could not read samples for download.'));
+            transaction.oncomplete = () => {
+                const blob = new Blob(parts, { type: 'text/csv;charset=utf-8' });
+                const url = URL.createObjectURL(blob);
+                const link = document.createElement('a');
+                link.href = url;
+                link.download = 'robot-log-' + session.id + '.csv';
+                link.click();
+                window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+                resolve();
+            };
+            transaction.onerror = () => reject(transaction.error || new Error('Could not export phone-saved session.'));
+        }))
+        .then(() => setLogStatus('CSV downloaded from phone storage.', false))
+        .catch(error => setLogStatus('CSV download failed: ' + error.message, true));
+}
+
+function clearPhoneLogs() {
+    if (activeLogSessionId) {
+        setLogStatus('Stop the robot before clearing phone logs.', true);
+        return;
+    }
+    if (!window.confirm('Delete all robot log sessions saved on this phone?')) return;
+
+    flushPhoneSamples()
+        .then(() => new Promise((resolve, reject) => {
+            const transaction = phoneLogDatabase.transaction(['samples', 'sessions'], 'readwrite');
+            transaction.objectStore('samples').clear();
+            transaction.objectStore('sessions').clear();
+            transaction.oncomplete = resolve;
+            transaction.onerror = () => reject(transaction.error || new Error('Could not clear phone logs.'));
+            transaction.onabort = () => reject(transaction.error || new Error('Clearing phone logs was aborted.'));
+        }))
+        .then(() => {
+            phoneSessions.clear();
+            selectedLogSessionId = null;
+            parsedLogHeaders = liveLogHeaders.slice();
+            parsedLogRows = [];
+            lastSessionStats = null;
+            resetLogChartViews();
+            renderLogViews();
+            renderPhoneSessionOptions();
+            updateSessionStatsViews();
+            setLogStatus('Phone-saved sessions cleared.', false);
+        })
+        .catch(error => setLogStatus('Could not clear phone logs: ' + error.message, true));
 }
 
 const chartColors = ['#4fc3f7', '#ff7043', '#a5d6a7', '#ffd54f', '#ce93d8', '#80cbc4', '#f48fb1', '#b0bec5'];
@@ -3175,12 +3786,12 @@ function updateChartControls(canvas, view) {
     const range = document.getElementById(canvas.dataset.rangeId);
     if (!range) return;
     if (!total || !size) {
-        range.textContent = 'Parse saved data to enable chart navigation.';
+        range.textContent = 'Select a phone-saved session to enable chart navigation.';
         return;
     }
     const firstTime = parsedLogRows[view.start][0];
     const lastTime = parsedLogRows[view.end - 1][0];
-    range.textContent = 'Samples ' + (view.start + 1) + '-' + view.end + ' of ' + total
+    range.textContent = 'Chart points ' + (view.start + 1) + '-' + view.end + ' of ' + total
         + ' (' + firstTime + '-' + lastTime + ' ms)';
 }
 
@@ -3404,31 +4015,6 @@ function drawChart(canvas, series) {
     context.restore();
 }
 
-function clearSavedLogs() {
-    if (!window.confirm('Clear all saved robot logs? If LittleFS cannot mount, this will format the log partition.')) return;
-    setLogStatus('Clearing saved data...', false);
-    fetch('/logs/clear', { method: 'POST' })
-        .then(response => response.text().then(text => {
-            if (!response.ok) throw new Error(text || response.statusText);
-            return text;
-        }))
-        .then(message => {
-            parsedLogHeaders = [];
-            parsedLogRows = [];
-            document.querySelectorAll('canvas[data-log-series]').forEach(canvas => {
-                resetChartView(canvas);
-                drawChart(canvas, []);
-                renderChartLegend(canvas, []);
-            });
-            document.querySelectorAll('pre[data-log-series]').forEach(view => {
-                view.textContent = 'Press Parse saved data to load these signals.';
-            });
-            return refreshLastSessionStats().then(() => message);
-        })
-        .then(message => setLogStatus(message, false))
-        .catch(error => setLogStatus('Clear failed: ' + error.message, true));
-}
-
 function pressButton(id) {
     fetch('/button?id=' + id);
 }
@@ -3482,13 +4068,30 @@ function refreshDisplay() {
 
 setInterval(refreshDisplay, 250);
 setInterval(refreshNotification, 100);
-setInterval(refreshLastSessionStats, 1000);
+setInterval(() => {
+    flushPhoneSamples().catch(error =>
+        setLogStatus('Phone storage write failed: ' + error.message, true));
+    if (liveChartsDirty) {
+        liveChartsDirty = false;
+        renderLogViews();
+    }
+}, 500);
 window.addEventListener('load', () => {
     refreshDisplay();
     refreshNotification();
-    refreshLastSessionStats();
+    initializePhoneLogger();
     initializeAngleWheels();
     initializePresetManager();
+});
+document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'hidden') {
+        flushPhoneSamples().catch(error =>
+            setLogStatus('Phone storage write failed: ' + error.message, true));
+    }
+});
+window.addEventListener('pagehide', () => {
+    flushPhoneSamples().catch(error =>
+        setLogStatus('Phone storage write failed: ' + error.message, true));
 });
 window.addEventListener('resize', () => {
     if (!parsedLogHeaders.length) return;
@@ -3575,10 +4178,11 @@ window.addEventListener('resize', () => {
         if (_logSource && tabNames[tabIndex] == logTab)
         {
             html += "<div class='log-toolbar'>";
-            html += "<button class='button' type='button' onclick='parseSavedLogs()'>Parse saved data</button>";
-            html += "<button class='button' type='button' onclick='clearSavedLogs()'>Clear flash data</button>";
-            html += "<span id='logStatus'>Press Parse saved data to read the flash log.</span>";
-            html += "<span id='lastSessionSummary'>Loading last-session statistics...</span>";
+            html += "<span id='logStatus'>Opening phone storage and live stream...</span>";
+            html += "<select id='phoneLogSessions' aria-label='Phone-saved sessions' onchange='loadSelectedPhoneSession()'></select>";
+            html += "<button class='button' type='button' onclick='downloadSelectedSession()'>Download CSV</button>";
+            html += "<button class='button' type='button' onclick='clearPhoneLogs()'>Clear phone logs</button>";
+            html += "<span id='lastSessionSummary'>No phone-saved session selected.</span>";
             html += "</div>";
         }
 

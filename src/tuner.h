@@ -1,13 +1,17 @@
 #pragma once
 
+#include "data_logger.h"
+
 #include <Arduino.h>
 #include <WiFi.h>
 #include <WebServer.h>
+#include <ESPAsyncWebServer.h>
 #include <Preferences.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/queue.h>
+#include <freertos/task.h>
 #include <stdarg.h>
 #include <initializer_list>
-
-class DataLogger;
 
 class WiFiTuner
 {
@@ -29,6 +33,7 @@ public:
     // Connects the tuner to an existing Wi-Fi network; falls back to the access point on failure.
     void begin(const char *ssid, const char *password);
     void handle();
+    bool queueLogFrame(const DataLogger::StreamFrame &frame);
 
     void notify(const char *message, unsigned long durationUs);
     void cancelNotification();
@@ -171,6 +176,10 @@ public:
 
 private:
     WebServer _server;
+    AsyncWebServer _liveServer;
+    AsyncWebSocket _liveWebSocket;
+    QueueHandle_t _liveLogQueue;
+    TaskHandle_t _liveLogTaskHandle;
     Preferences _presetPreferences;
 
     enum ParameterType
@@ -278,6 +287,9 @@ private:
 
     void initializePresetStorage();
     void configureServer();
+    void configureLiveServer();
+    static void liveLogTaskEntry(void *context);
+    void liveLogTask();
     void handleRoot();
     void handleUpdate();
     void handlePresetSave();
@@ -286,9 +298,6 @@ private:
     void handleButton();
     void handleDisplay();
     void handleNotification();
-    void handleLogParse();
-    void handleLogStats();
-    void handleLogClear();
 
     void appendDisplayText(const char *text);
 

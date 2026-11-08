@@ -266,6 +266,12 @@ void setup()
   data_logger.add("left_speed", &left_speed);
   data_logger.add("right_speed", &right_speed);
   data_logger.add("dt_ms", &dt_ms);
+  data_logger.setStreamCallback(
+      [](const DataLogger::StreamFrame &frame, void *context)
+      {
+        return static_cast<WiFiTuner *>(context)->queueLogFrame(frame);
+      },
+      &tuner);
   data_logger.begin();
 
   tuner.addTab("Control");
@@ -296,7 +302,7 @@ void setup()
                     { memory.write_bool("weights_en", value); });
 
   tuner.addTab("Logs");
-  tuner.addCategory("Saved data");
+  tuner.addCategory("Phone-saved live data");
   tuner.addChart("sensors_error", data_logger, {"sensors_error"}, -50.0f, 50.0f);
   tuner.addChart("gyro_error", data_logger, {"gyro_error"}, -1025.0f, 1025.0f);
   tuner.addChart("signal_index", data_logger, {"signal_index"}, 0, 400000000);

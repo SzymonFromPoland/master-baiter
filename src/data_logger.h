@@ -1,14 +1,32 @@
 #pragma once
 
 #include <Arduino.h>
-#include <FS.h>
 
 class DataLogger
 {
 public:
-    using ValueCallback = float (*)(const void *context);
-
     static constexpr size_t MAX_SIGNALS = 24;
+
+    struct StreamFrame
+    {
+        enum class Type : uint8_t
+        {
+            SessionStart,
+            Sample,
+            SessionStop
+        };
+
+        Type type = Type::Sample;
+        char sessionId[17] = {};
+        uint32_t sequence = 0;
+        uint32_t droppedSamples = 0;
+        uint64_t elapsedMs = 0;
+        uint8_t signalCount = 0;
+        float values[MAX_SIGNALS] = {};
+    };
+
+    using ValueCallback = float (*)(const void *context);
+    using StreamCallback = bool (*)(const StreamFrame &frame, void *context);
 
     DataLogger();
 
@@ -31,19 +49,16 @@ public:
     }
 
     bool setSampleIntervalMs(uint32_t intervalMs);
-    // Applies to each started run; zero means no duration limit.
     void setMaxDurationMs(uint32_t durationMs);
+    void setStreamCallback(StreamCallback callback, void *context);
 
     bool begin();
-    // Samples are buffered while started, flushed when full, and flushed again after stopping.
+    // Samples are streamed while started; the phone is responsible for persistent storage.
     void update(bool started, bool enabled, uint32_t nowMs);
-    bool clear();
 
     bool hasSignal(const char *name) const;
-    File openRead() const;
+    String header() const;
     const String &status() const;
-    // Returns the persisted JSON summary for the most recently completed run.
-    const String &lastSessionStatsJson() const;
 
 private:
     struct Signal
@@ -53,50 +68,29 @@ private:
         const void *context = nullptr;
     };
 
-    struct SignalRange
-    {
-        float minimum = 0.0f;
-        float maximum = 0.0f;
-        bool hasSamples = false;
-    };
-
-    static constexpr size_t BUFFER_SIZE = 128 * 1024;
-    static const char FILE_PATH[];
-    static const char SESSION_STATS_FILE_PATH[];
-
     Signal _signals[MAX_SIGNALS];
-    SignalRange _activeSessionRanges[MAX_SIGNALS];
     size_t _signalCount;
-
-    char _pendingBuffer[BUFFER_SIZE];
-    size_t _pendingLength;
+    StreamCallback _streamCallback;
+    void *_streamContext;
     uint32_t _sampleIntervalMs;
     uint32_t _maxDurationMs;
     uint32_t _runStartedAt;
     uint32_t _elapsedRunStartedAt;
     uint64_t _elapsedMs;
     uint32_t _lastSampleAt;
-    uint64_t _activeSessionBytesSaved;
-    uint32_t _activeSessionFlushCount;
-
-    bool _mounted;
+    uint32_t _sampleSequence;
+    uint32_t _droppedSamples;
     bool _schemaReady;
     bool _recordingFailed;
     bool _wasStarted;
     bool _recordingActive;
     bool _durationReached;
-
-    String _lastSessionStatsJson;
+    bool _sessionWasLogged;
+    char _sessionId[17];
     String _status;
 
-    String header() const;
-    bool restoreElapsedMs();
-    bool restoreLastSessionStats();
-    bool saveLastSessionStats() const;
-    String buildSessionStatsJson() const;
-    void resetActiveSessionStats();
-    bool writeHeader(File &file);
+    void beginSession(uint32_t nowMs);
+    void emitSessionEvent(StreamFrame::Type type);
     bool appendSample(uint64_t elapsedMs);
-    bool flushBuffer();
     void setError(const char *message);
 };
