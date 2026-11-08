@@ -1829,7 +1829,7 @@ void WiFiTuner::handleLogParse()
     _server.sendHeader("Cache-Control", "no-store");
     _server.sendHeader("X-Log-Status", _logSource->status());
     _server.streamFile(file, "text/csv");
-    file.close();
+    _logSource->closeRead(file);
 }
 
 void WiFiTuner::handleLogClear()

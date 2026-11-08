@@ -1,6 +1,6 @@
 #include <Arduino.h>
 #include <Wire.h>
-#include <VL53L1X_ULD.h>
+#include <vl53l1x_class.h>
 
 #include <tuner.h>
 #include <data_logger.h>
@@ -41,8 +41,30 @@ const uint8_t xs_pins[5] = {
 };
 const uint8_t sensor_addresses[sensor_count] = {0x2A, 0x2C, 0x2E, 0x30, 0x32};
 
-VL53L1X_ULD sensors[sensor_count];
-VL53L1X_Result_t results[sensor_count];
+VL53L1X sensor1(&Wire, xs_pins[0]);
+VL53L1X sensor2(&Wire, xs_pins[1]);
+VL53L1X sensor3(&Wire, xs_pins[2]);
+VL53L1X sensor4(&Wire, xs_pins[3]);
+VL53L1X sensor5(&Wire, xs_pins[4]);
+VL53L1X *sensors[sensor_count] = {&sensor1, &sensor2, &sensor3, &sensor4, &sensor5};
+
+struct SensorResult
+{
+  uint8_t Status;
+  uint16_t Distance;
+  uint16_t Ambient;
+  uint16_t SigPerSPAD;
+  uint16_t NumSPADs;
+};
+
+enum class SensorReadState : uint8_t
+{
+  Error,
+  NotReady,
+  Ready
+};
+
+SensorResult results[sensor_count] = {};
 bool sensors_en = true;
 
 Gyro mpu6050;
@@ -117,9 +139,19 @@ bool started = false;
 bool logging_en = false;
 bool telemetry_en = false;
 
-float distance;
-float signal_spad;
-long long signal_index;
+float distance = 0;
+float signal_spad = 0;
+long long signal_index = 0;
+float dt = 0.0f;
+float dt_ms = 0.0f;
+float sensor_read_ms = 0.0f;
+float sensor_read_ms_by_sensor[sensor_count] = {};
+uint32_t sensor_read_errors[sensor_count] = {};
+float tuner_handle_ms = 0.0f;
+float logger_enqueue_ms = 0.0f;
+float logger_flush_ms = 0.0f;
+float logger_queue_depth = 0.0f;
+float logger_dropped_samples = 0.0f;
 
 void set_started(bool state)
 {
@@ -132,29 +164,59 @@ void set_started(bool state)
   started = state;
 }
 
-bool init_sensor(VL53L1X_ULD &sensor, uint8_t address, uint8_t xshut)
+bool init_sensor(VL53L1X &sensor, uint8_t address)
 {
-  digitalWrite(xshut, HIGH);
-  delay(50);
-  if (sensor.Begin(address) != VL53L1_ERROR_NONE)
+  if (sensor.begin() != 0)
     return false;
 
-  if (sensor.SetI2CAddress(address) != VL53L1_ERROR_NONE)
+  // This library uses 8-bit addresses; sensor_addresses stores standard 7-bit addresses.
+  if (sensor.InitSensor(static_cast<uint8_t>(address << 1)) != 0)
     return false;
-  delay(10);
 
   return true;
 }
 
-void set_sensor_settings(VL53L1X_ULD &sensor, EDistanceMode mode, uint16_t roi[2], uint16_t timing_budget, uint16_t inter_measurement, uint16_t threshold)
+bool set_sensor_settings(VL53L1X &sensor, uint16_t roi[2], uint16_t timing_budget, uint16_t inter_measurement)
 {
-  sensor.SetDistanceMode(mode);
-  sensor.SetROI(roi[0], roi[1]);
-  sensor.SetTimingBudgetInMs(timing_budget);
-  sensor.SetInterMeasurementInMs(inter_measurement);
-  sensor.SetInterruptPolarity(ActiveLOW);
-  sensor.SetDistanceThreshold(0, threshold, Out);
-  sensor.StartRanging();
+  // Keep the GPIO interrupt in new-sample-ready mode; distance thresholds are applied in software.
+  return sensor.VL53L1X_SetDistanceMode(1) == 0 &&
+         sensor.VL53L1X_SetROI(roi[0], roi[1]) == 0 &&
+         sensor.VL53L1X_SetTimingBudgetInMs(timing_budget) == 0 &&
+         sensor.VL53L1X_SetInterMeasurementInMs(inter_measurement) == 0 &&
+         sensor.VL53L1X_SetInterruptPolarity(0) == 0 &&
+         sensor.VL53L1X_StartRanging() == 0;
+}
+
+SensorReadState read_sensor(
+    VL53L1X &sensor,
+    SensorResult &result,
+    bool includeSignalMetrics,
+    bool includeAmbientRate)
+{
+  uint8_t data_ready = 0;
+  if (sensor.VL53L1X_CheckForDataReady(&data_ready) != 0)
+    return SensorReadState::Error;
+  if (!data_ready)
+    return SensorReadState::NotReady;
+
+  SensorResult sample = {};
+  bool result_read =
+      sensor.VL53L1X_GetRangeStatus(&sample.Status) == 0 &&
+      sensor.VL53L1X_GetDistance(&sample.Distance) == 0;
+  if (result_read && includeAmbientRate)
+    result_read = sensor.VL53L1X_GetAmbientRate(&sample.Ambient) == 0;
+  if (result_read && includeSignalMetrics)
+  {
+    result_read =
+        sensor.VL53L1X_GetSignalPerSpad(&sample.SigPerSPAD) == 0 &&
+        sensor.VL53L1X_GetSpadNb(&sample.NumSPADs) == 0;
+  }
+  const bool interrupt_cleared = sensor.VL53L1X_ClearInterrupt() == 0;
+  if (!result_read || !interrupt_cleared)
+    return SensorReadState::Error;
+
+  result = sample;
+  return SensorReadState::Ready;
 }
 
 uint16_t roi[2] = {13, 6}; // 13x4
@@ -169,6 +231,7 @@ void setup()
   enableLoopWDT();
 
   Wire.begin(5, 6, 300000);
+  Wire.setTimeOut(10);
 
   flag.begin(flag_pin, 95, 200);
 
@@ -188,10 +251,19 @@ void setup()
 
   for (uint8_t i = 0; i < sensor_count; i++)
   {
-    if (!init_sensor(sensors[i], sensor_addresses[i], xs_pins[i]))
-      while (1)
-        ;
-    set_sensor_settings(sensors[i], Short, roi, 15, 15, threshold1);
+    if (!init_sensor(*sensors[i], sensor_addresses[i]))
+    {
+      Serial.printf("[VL53L1X] Failed to initialize sensor %u at address 0x%02X\n",
+                    static_cast<unsigned>(i), sensor_addresses[i]);
+      while (true)
+        delay(1000);
+    }
+    if (!set_sensor_settings(*sensors[i], roi, 15, 15))
+    {
+      Serial.printf("[VL53L1X] Failed to configure sensor %u\n", static_cast<unsigned>(i));
+      while (true)
+        delay(1000);
+    }
   }
 
   if (mpu6050.begin())
@@ -238,6 +310,11 @@ void setup()
   threshold1 = memory.read_uint16("thres1", threshold1);
   threshold2 = memory.read_uint16("thres2", threshold2);
   threshold3 = memory.read_uint16("thres3", threshold3);
+  for (uint8_t i = 0; i < sensor_count; ++i)
+  {
+    results[i].Status = 0xFF;
+    results[i].Distance = threshold1;
+  }
   en_slow_down = memory.read_bool("en_slow_down", en_slow_down);
 
   strength_fast = memory.read_float("strength_fast", strength_fast);
@@ -264,7 +341,14 @@ void setup()
   data_logger.add("gyro_error", &gyro_error);
   data_logger.add("left_speed", &left_speed);
   data_logger.add("right_speed", &right_speed);
-  data_logger.begin();
+  data_logger.add("dt_ms", &dt_ms);
+  data_logger.add("sensor_read_ms", &sensor_read_ms);
+  data_logger.add("tuner_handle_ms", &tuner_handle_ms);
+  data_logger.add("logger_enqueue_ms", &logger_enqueue_ms);
+  data_logger.add("logger_flush_ms", &logger_flush_ms);
+  data_logger.add("logger_queue_depth", &logger_queue_depth);
+  data_logger.add("logger_dropped_samples", &logger_dropped_samples);
+  const bool dataLoggerReady = data_logger.begin();
 
   tuner.addTab("Control");
   tuner.addCategory("Control");
@@ -296,8 +380,13 @@ void setup()
   tuner.addTab("Logs");
   tuner.addCategory("Saved data");
   tuner.addChart("sensors_error", data_logger, {"sensors_error"}, -50.0f, 50.0f);
-  tuner.addChart("gyro_error", data_logger, {"gyro_error"}, -1025.0f, 1025.0f);
+  tuner.addChart("gyro_error", data_logger, {"gyro_error"}, -180.0f, 180.0f);
   tuner.addChart("signal_index", data_logger, {"signal_index"}, 0, 400000000);
+  tuner.addChart(
+      "Loop timing (ms)",
+      data_logger,
+      {"dt_ms", "sensor_read_ms", "tuner_handle_ms", "logger_enqueue_ms", "logger_flush_ms"});
+  tuner.addRaw("Logger queue", data_logger, {"logger_queue_depth", "logger_dropped_samples"});
   tuner.addChart("signal_spad/distance", data_logger, {"signal_spad", "distance"}, 0.0f, 1.0f);
   tuner.addChart("motor_speeds", data_logger, {"left_speed", "right_speed"}, -1023.0f, 1023.0f);
 
@@ -365,7 +454,13 @@ void setup()
   tuner.addSlider("Gyro Kd", &gyroKd, 0, 100, 0.1f, [](float value)
                   { gyroPID.setGains(gyroKp, gyroKi, gyroKd); memory.write_float("gyroKd", value); });
 
-  tuner.begin(ssid, password);
+  tuner.begin();
+  if (!dataLoggerReady)
+  {
+    String message = "Data logging unavailable: ";
+    message += data_logger.status();
+    tuner.notify(message.c_str(), 5000000UL);
+  }
 
   remote.addPROGListener([](decode_results results)
                          { memory.write_uint8("start_comm", results.command + 1); memory.write_uint8("stop_comm", results.command); tuner.notify("Programmed", 2000000UL); });
@@ -390,7 +485,8 @@ const float sensorAngles[sensor_count] = {-50.0f, -24.0f, 0.0f, 24.0f, 50.0f};
 void loop()
 {
   unsigned long now = micros();
-  float dt = get_dt(now);
+  dt = get_dt(now);
+  dt_ms = dt * 1000.0f;
 
   remote.handle();
   tuner.handle();
@@ -437,6 +533,9 @@ void loop()
   if (mpu6050.calibrate_flag)
     sensors_en = false;
 
+  sensor_read_ms = 0.0f;
+  for (uint8_t i = 0; i < sensor_count; ++i)
+    sensor_read_ms_by_sensor[i] = 0.0f;
   if (sensors_en)
   {
 
@@ -447,11 +546,25 @@ void loop()
 
     for (int i = 0; i < sensor_count; i++)
     {
-      if (sensors[i].GetResult(&results[i]) != VL53L1_ERROR_NONE)
+      const uint32_t readStartedAt = micros();
+      const SensorReadState read_state = read_sensor(
+          *sensors[i],
+          results[i],
+          i == 2 || telemetry_en,
+          telemetry_en);
+      sensor_read_ms_by_sensor[i] =
+          static_cast<float>(micros() - readStartedAt) / 1000.0f;
+      sensor_read_ms += sensor_read_ms_by_sensor[i];
+      if (read_state == SensorReadState::Error)
       {
+        if (sensor_read_errors[i] < UINT32_MAX)
+          ++sensor_read_errors[i];
+        results[i].Status = 0xFF;
         results[i].Distance = threshold1;
         continue;
       }
+      if (read_state == SensorReadState::NotReady)
+        continue;
 
       if (results[i].Status == 0)
       {
@@ -460,7 +573,6 @@ void loop()
 
         if (results[i].Distance < threshold1)
         {
-          sensors[i].ClearInterrupt();
           target_detected = true;
 
           const float s = 1.0f / max((float)results[i].Distance, 1.0f);
@@ -746,15 +858,36 @@ void loop()
   else
     drive.setSpeed(0, 0);
 
+  logger_flush_ms = static_cast<float>(data_logger.lastFlushDurationUs()) / 1000.0f;
+  logger_queue_depth = static_cast<float>(data_logger.queueDepth());
+  logger_dropped_samples = static_cast<float>(data_logger.droppedSamples());
   if (logging_en)
+  {
+    const uint32_t loggerStartedAt = micros();
     data_logger.update(started, millis());
+    logger_enqueue_ms = static_cast<float>(micros() - loggerStartedAt) / 1000.0f;
+  }
 
   static unsigned long lastTunerUpdateUs = 0;
   if (now - lastTunerUpdateUs >= 100000UL && telemetry_en)
   {
     lastTunerUpdateUs = now;
     tuner.clearDisplay();
-    tuner.printf("dt: %.2f\n", dt * 1000.0f);
+    tuner.printf("dt: %.2f ms\n", dt_ms);
+    tuner.printf("sensor reads: %.2f ms\n", sensor_read_ms);
+    tuner.printf("tuner handle: %.2f ms\n", tuner_handle_ms);
+    tuner.printf("logger enqueue: %.2f ms\n", logger_enqueue_ms);
+    tuner.printf(
+        "LittleFS last/max: %.2f/%.2f ms (%lu writes)\n",
+        static_cast<float>(data_logger.lastFlushDurationUs()) / 1000.0f,
+        static_cast<float>(data_logger.maxFlushDurationUs()) / 1000.0f,
+        static_cast<unsigned long>(data_logger.flushCount()));
+    tuner.printf(
+        "Logger queue: %lu/%lu, dropped: %lu\n\n",
+        static_cast<unsigned long>(data_logger.queueDepth()),
+        static_cast<unsigned long>(data_logger.queueHighWatermark()),
+        static_cast<unsigned long>(data_logger.droppedSamples()));
+    tuner.printf("Logger status: %s\n", data_logger.status().c_str());
     tuner.printf("started: %s\n\n", started ? "ON" : "OFF");
 
     tuner.printf("last_reset: %d\n\n", memory.read_int("last_rst", 0));
@@ -776,6 +909,11 @@ void loop()
     for (int s = 0; s < sensor_count; s++)
     {
       long long index = (long long)((results[s].SigPerSPAD * (results[s].Distance > 0 ? (results[s].Distance * results[s].Distance) : 1)) / (results[s].NumSPADs > 0 ? results[s].NumSPADs : 1));
+      tuner.printf(
+          "sensor[%d] read: %.2f ms, I2C errors: %lu\n",
+          s,
+          sensor_read_ms_by_sensor[s],
+          static_cast<unsigned long>(sensor_read_errors[s]));
       tuner.printf("distance[%d]: %u\n", s, results[s].Distance);
       tuner.printf("status[%d]: %u\n", s, results[s].Status);
       tuner.printf("ambient[%d]: %u\n", s, results[s].Ambient);
@@ -783,5 +921,13 @@ void loop()
       tuner.printf("numspad[%d]: %u\n", s, results[s].NumSPADs);
       tuner.printf("index[%d]: %lld\n\n", s, index);
     }
+  }
+
+  static unsigned long lastLoggerStatusUpdateUs = 0;
+  if (!telemetry_en && now - lastLoggerStatusUpdateUs >= 100000UL)
+  {
+    lastLoggerStatusUpdateUs = now;
+    tuner.clearDisplay();
+    tuner.printf("Logger status: %s\n", data_logger.status().c_str());
   }
 }
