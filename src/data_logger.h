@@ -51,7 +51,7 @@ private:
         const void *context = nullptr;
     };
 
-    static constexpr size_t BUFFER_SIZE = 2048;
+    static constexpr size_t BUFFER_SIZE = 131072;
     static constexpr uint32_t FLUSH_INTERVAL_MS = 1000;
     static const char FILE_PATH[];
 
