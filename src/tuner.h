@@ -7,7 +7,7 @@
 #include <stdarg.h>
 #include <initializer_list>
 
-class DataLogger;
+class Telemetry;
 
 class WiFiTuner
 {
@@ -39,6 +39,7 @@ public:
 
     void addTab(const char *name);
     void addCategory(const char *name);
+    void setTelemetry(Telemetry &telemetry);
     // Adds a draggable circular control for a signed angle in [-180, 180].
     void addAngle(
         const char *name,
@@ -48,17 +49,17 @@ public:
     // Displays selected log signals together on one timestamped, comma-separated line per sample.
     bool addRaw(
         const char *title,
-        DataLogger &logger,
+        Telemetry &telemetry,
         std::initializer_list<const char *> signals);
-    // Adds selected logger columns as series on one shared chart, e.g. {"distance_0", "distance_1"}.
+    // Adds selected telemetry signals as series on one shared chart.
     bool addChart(
         const char *title,
-        DataLogger &logger,
+        Telemetry &telemetry,
         std::initializer_list<const char *> signals);
     // Sets a fixed shared Y-axis range instead of scaling to the observed samples.
     bool addChart(
         const char *title,
-        DataLogger &logger,
+        Telemetry &telemetry,
         std::initializer_list<const char *> signals,
         float minimum,
         float maximum);
@@ -267,7 +268,7 @@ private:
     String _currentCategory;
     String _currentTab;
     String _displayText;
-    DataLogger *_logSource;
+    Telemetry *_logSource;
     bool _hasDisplay;
     String _notificationMessage;
     unsigned long _notificationStartedUs;
@@ -279,7 +280,9 @@ private:
     void initializePresetStorage();
     void configureServer();
     void handleRoot();
+    void handleSchema();
     void handleUpdate();
+    void handlePresetList();
     void handlePresetSave();
     void handlePresetLoad();
     void handlePresetDelete();
@@ -324,7 +327,7 @@ private:
 
     bool addLogView(
         const char *title,
-        DataLogger &logger,
+        Telemetry &telemetry,
         std::initializer_list<const char *> signals,
         ParameterType type,
         bool hasChartBounds = false,

@@ -3,7 +3,7 @@
 #include <VL53L1X_ULD.h>
 
 #include <tuner.h>
-#include <data_logger.h>
+#include <telemetry.h>
 #include <gyro.h>
 #include <servo.h>
 #include <memory.h>
@@ -46,7 +46,7 @@ VL53L1X_Result_t results[sensor_count];
 bool sensors_en = true;
 
 Gyro mpu6050;
-DataLogger data_logger;
+Telemetry telemetry;
 WiFiTuner tuner;
 Remote remote(receiver_pin, 5);
 ServoControl flag;
@@ -115,7 +115,6 @@ uint8_t stop_command = 0x00;
 
 bool started = false;
 bool logging_en = false;
-bool telemetry_en = false;
 
 float distance = 0;
 float signal_spad = 0;
@@ -206,14 +205,14 @@ void setup()
     mpu6050.disable();
   }
 
-  memory.begin("robot");
+  if (!memory.begin("robot"))
+    Serial.println("[Memory] Could not open settings storage; preferences will not persist.");
 
   memory.write_int("last_rst", (int)esp_reset_reason());
 
   current_mode = mode = memory.read_int("mode", mode);
   weights_en = memory.read_bool("weights_en", weights_en);
   logging_en = memory.read_bool("logging_en", logging_en);
-  telemetry_en = memory.read_bool("telemetry_en", telemetry_en);
 
   panic_slow = memory.read_ulong("panic_slow", panic_slow);
   panic_fast = memory.read_ulong("panic_fast", panic_fast);
@@ -256,18 +255,18 @@ void setup()
   stop_command = memory.read_uint8("stop_comm");
   remote.set_stop_command(stop_command);
 
-  data_logger.setSampleIntervalMs(10);
-  data_logger.setMaxDurationMs(0);
-  data_logger.add("sensors_error", &sensors_error);
-  data_logger.add("signal_index", &signal_index);
-  data_logger.add("signal_spad", &signal_spad);
-  data_logger.add("distance", &distance);
-  data_logger.add("gyro_error", &gyro_error);
-  data_logger.add("left_speed", &left_speed);
-  data_logger.add("right_speed", &right_speed);
-  data_logger.add("dt_ms", &dt_ms);
-  data_logger.begin();
+  // Loop count, not milliseconds: sample once per main-loop iteration.
+  telemetry.setSampleIntervalLoops(1);
+  telemetry.add("sensors_error", &sensors_error);
+  telemetry.add("signal_index", &signal_index);
+  telemetry.add("signal_spad", &signal_spad);
+  telemetry.add("distance", &distance);
+  telemetry.add("gyro_error", &gyro_error);
+  telemetry.add("left_speed", &left_speed);
+  telemetry.add("right_speed", &right_speed);
+  telemetry.add("dt_ms", &dt_ms);
 
+  tuner.setTelemetry(telemetry);
   tuner.addTab("Control");
   tuner.addCategory("Control");
   tuner.addButton("ON/OFF", []
@@ -280,8 +279,6 @@ void setup()
                   { flag.test(); });
   tuner.addDropdown("Logging", &logging_en, {"OFF", "ON"}, {false, true}, [](bool value)
                     { memory.write_bool("logging_en", value); });
-  tuner.addDropdown("Telemetry", &telemetry_en, {"OFF", "ON"}, {false, true}, [](bool value)
-                    { memory.write_bool("telemetry_en", value); });
 
   tuner.addCategory("Safety");
   tuner.addSlider("Panic slow [ ms ]", &panic_slow, 0UL, 10000UL, 100UL, [](unsigned long value)
@@ -297,12 +294,12 @@ void setup()
 
   tuner.addTab("Logs");
   tuner.addCategory("Saved data");
-  tuner.addChart("sensors_error", data_logger, {"sensors_error"}, -50.0f, 50.0f);
-  tuner.addChart("gyro_error", data_logger, {"gyro_error"}, -1025.0f, 1025.0f);
-  tuner.addChart("signal_index", data_logger, {"signal_index"}, 0, 400000000);
-  tuner.addChart("signal_spad/distance", data_logger, {"signal_spad", "distance"}, 0.0f, 1.0f);
-  tuner.addChart("motor_speeds", data_logger, {"left_speed", "right_speed"}, -1023.0f, 1023.0f);
-  tuner.addChart("dt_ms", data_logger, {"dt_ms"}, 0.0f, 100.0f);
+  tuner.addChart("sensors_error", telemetry, {"sensors_error"}, -50.0f, 50.0f);
+  tuner.addChart("gyro_error", telemetry, {"gyro_error"}, -1025.0f, 1025.0f);
+  tuner.addChart("signal_index", telemetry, {"signal_index"}, 0, 400000000);
+  tuner.addChart("signal_spad/distance", telemetry, {"signal_spad", "distance"}, 0.0f, 1.0f);
+  tuner.addChart("motor_speeds", telemetry, {"left_speed", "right_speed"}, -1023.0f, 1023.0f);
+  tuner.addChart("dt_ms", telemetry, {"dt_ms"}, 0.0f, 100.0f);
   tuner.addCategory("Status");
   tuner.addDisplay("Live readings");
 
@@ -321,6 +318,7 @@ void setup()
   tuner.addSlider("Slow strength", &strength_slow, 0.0f, 10000.0f, 10.0f, [](float value)
                   { distance_strength = value; memory.write_float("strength_slow", value); });
 
+  tuner.addTab("Angle");
   tuner.addCategory("Accelerometer");
   tuner.addAngle("Target", &target_angle, [](float value)
                  { memory.write_float("target_angle", value); current_target_angle = target_angle; });
@@ -368,6 +366,8 @@ void setup()
                   { gyroPID.setGains(gyroKp, gyroKi, gyroKd); memory.write_float("gyroKd", value); });
 
   tuner.begin();
+  if (!telemetry.begin())
+    logging_en = false;
 
   remote.addPROGListener([](decode_results results)
                          { memory.write_uint8("start_comm", results.command + 1); memory.write_uint8("stop_comm", results.command); tuner.notify("Programmed", 2000000UL); });
@@ -750,41 +750,7 @@ void loop()
   else
     drive.setSpeed(0, 0);
 
-  data_logger.update(started, logging_en, millis());
-
-  static unsigned long lastTunerUpdateUs = 0;
-  if (now - lastTunerUpdateUs >= 100000UL && telemetry_en)
-  {
-    lastTunerUpdateUs = now;
-    tuner.clearDisplay();
-    tuner.printf("dt: %.2f\n", dt * 1000.0f);
-    tuner.printf("started: %s\n\n", started ? "ON" : "OFF");
-
-    tuner.printf("last_reset: %d\n\n", memory.read_int("last_rst", 0));
-
-    tuner.printf("error: %.1f\n", sensors_error);
-    tuner.printf("strength: %.3f\n", sensors_strength);
-    tuner.printf("raw_drive_output: %.2f\n", raw_drive_pid_output);
-    tuner.printf("drive_output: %.2f\n\n", drive_output);
-
-    tuner.printf("speed_left: %.1f\n", left_speed);
-    tuner.printf("speed_right: %.1f\n\n", right_speed);
-
-    tuner.printf("angle: %.1f\n", current_angle);
-    tuner.printf("target_angle: %.1f\n", current_target_angle);
-    tuner.printf("gyro_error: %.1f\n", gyro_error);
-    tuner.printf("gyro_output: %.1f\n", gyro_output);
-    tuner.printf("target_reached: %s\n\n", (target_reached) ? "true" : "false");
-
-    for (int s = 0; s < sensor_count; s++)
-    {
-      long long index = (long long)((results[s].SigPerSPAD * (results[s].Distance > 0 ? (results[s].Distance * results[s].Distance) : 1)) / (results[s].NumSPADs > 0 ? results[s].NumSPADs : 1));
-      tuner.printf("distance[%d]: %u\n", s, results[s].Distance);
-      tuner.printf("status[%d]: %u\n", s, results[s].Status);
-      tuner.printf("ambient[%d]: %u\n", s, results[s].Ambient);
-      tuner.printf("sigperspad[%d]: %u\n", s, results[s].SigPerSPAD);
-      tuner.printf("numspad[%d]: %u\n", s, results[s].NumSPADs);
-      tuner.printf("index[%d]: %lld\n\n", s, index);
-    }
-  }
+  telemetry.setRunState(started);
+  telemetry.setRecordingState(started && logging_en);
+  telemetry.update(started, logging_en && telemetry.connected(), millis());
 }

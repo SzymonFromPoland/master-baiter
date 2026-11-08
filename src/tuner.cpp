@@ -1,8 +1,9 @@
 #include "tuner.h"
 
-#include "data_logger.h"
+#include "telemetry.h"
 
 #include <math.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -55,6 +56,52 @@ String escapeHtml(const String &value)
     }
     return escaped;
 }
+
+void appendJsonString(String &json, const String &value)
+{
+    json += '"';
+    for (size_t i = 0; i < value.length(); ++i)
+    {
+        const char character = value[i];
+        switch (character)
+        {
+        case '"':
+            json += "\\\"";
+            break;
+        case '\\':
+            json += "\\\\";
+            break;
+        case '\b':
+            json += "\\b";
+            break;
+        case '\f':
+            json += "\\f";
+            break;
+        case '\n':
+            json += "\\n";
+            break;
+        case '\r':
+            json += "\\r";
+            break;
+        case '\t':
+            json += "\\t";
+            break;
+        default:
+            if (static_cast<uint8_t>(character) < 0x20)
+            {
+                char escaped[7];
+                snprintf(escaped, sizeof(escaped), "\\u%04x", static_cast<unsigned char>(character));
+                json += escaped;
+            }
+            else
+            {
+                json += character;
+            }
+            break;
+        }
+    }
+    json += '"';
+}
 }
 
 WiFiTuner::WiFiTuner()
@@ -100,6 +147,12 @@ void WiFiTuner::configureServer()
     _server.on("/", HTTP_GET, [this]()
                { handleRoot(); });
 
+    _server.on("/api/schema", HTTP_GET, [this]()
+               { handleSchema(); });
+
+    _server.on("/presets", HTTP_GET, [this]()
+               { handlePresetList(); });
+
     _server.on("/update", HTTP_GET, [this]()
                { handleUpdate(); });
 
@@ -127,15 +180,6 @@ void WiFiTuner::configureServer()
                    _server.send(200, "text/plain", "OK");
                });
 
-    _server.on("/logs", HTTP_GET, [this]()
-               { handleLogParse(); });
-
-    _server.on("/logs/stats", HTTP_GET, [this]()
-               { handleLogStats(); });
-
-    _server.on("/logs/clear", HTTP_POST, [this]()
-               { handleLogClear(); });
-
     _server.begin();
 }
 
@@ -150,7 +194,7 @@ void WiFiTuner::begin(const char *ssid)
     configureServer();
 
     Serial.println();
-    Serial.println("WiFi tuner started");
+    Serial.println("Robot control API started");
     Serial.print("SSID: ");
     Serial.println(ssid);
     Serial.print("IP: ");
@@ -195,7 +239,7 @@ void WiFiTuner::begin(const char *ssid, const char *password)
     configureServer();
 
     Serial.println();
-    Serial.println("WiFi tuner started");
+    Serial.println("Robot control API started");
     Serial.print("Connected to SSID: ");
     Serial.println(ssid);
     Serial.print("IP: ");
@@ -334,35 +378,40 @@ void WiFiTuner::addAngle(
     p.buttonCallback = nullptr;
 }
 
+void WiFiTuner::setTelemetry(Telemetry &telemetry)
+{
+    _logSource = &telemetry;
+}
+
 bool WiFiTuner::addRaw(
     const char *title,
-    DataLogger &logger,
+    Telemetry &telemetry,
     std::initializer_list<const char *> signals)
 {
-    return addLogView(title, logger, signals, LOG_RAW);
+    return addLogView(title, telemetry, signals, LOG_RAW);
 }
 
 bool WiFiTuner::addChart(
     const char *title,
-    DataLogger &logger,
+    Telemetry &telemetry,
     std::initializer_list<const char *> signals)
 {
-    return addLogView(title, logger, signals, LOG_CHART);
+    return addLogView(title, telemetry, signals, LOG_CHART);
 }
 
 bool WiFiTuner::addChart(
     const char *title,
-    DataLogger &logger,
+    Telemetry &telemetry,
     std::initializer_list<const char *> signals,
     float minimum,
     float maximum)
 {
-    return addLogView(title, logger, signals, LOG_CHART, true, minimum, maximum);
+    return addLogView(title, telemetry, signals, LOG_CHART, true, minimum, maximum);
 }
 
 bool WiFiTuner::addLogView(
     const char *title,
-    DataLogger &logger,
+    Telemetry &telemetry,
     std::initializer_list<const char *> signals,
     ParameterType type,
     bool hasChartBounds,
@@ -383,9 +432,9 @@ bool WiFiTuner::addLogView(
         return false;
     }
 
-    if (_logSource && _logSource != &logger)
+    if (_logSource && _logSource != &telemetry)
     {
-        Serial.println("[Tuner] Only one data logger can be displayed.");
+        Serial.println("[Tuner] Only one telemetry source can be displayed.");
         return false;
     }
 
@@ -398,9 +447,9 @@ bool WiFiTuner::addLogView(
     String series;
     for (auto current = signals.begin(); current != signals.end(); ++current)
     {
-        if (!*current || !logger.hasSignal(*current))
+        if (!*current || !telemetry.hasSignal(*current))
         {
-            Serial.printf("[Tuner] Log view '%s' references an unconfigured logger signal.\n", title);
+            Serial.printf("[Tuner] Log view '%s' references an unconfigured telemetry signal.\n", title);
             return false;
         }
 
@@ -437,7 +486,7 @@ bool WiFiTuner::addLogView(
     p.ulongCallback = nullptr;
     p.buttonCallback = nullptr;
 
-    _logSource = &logger;
+    _logSource = &telemetry;
     return true;
 }
 
@@ -1604,8 +1653,185 @@ String WiFiTuner::presetManagerHTML()
 
 void WiFiTuner::handleRoot()
 {
+    _server.send(410, "text/plain", "The tuner interface is available in the Android app.");
+}
+
+void WiFiTuner::handleSchema()
+{
+    String response = "{\"version\":1,\"parameters\":[";
+    bool firstParameter = true;
+
+    for (int i = 0; i < _parameterCount; ++i)
+    {
+        const Parameter &parameter = _parameters[i];
+        const char *type = nullptr;
+        double minimum = 0.0;
+        double maximum = 0.0;
+        double step = 0.0;
+
+        switch (parameter.type)
+        {
+        case SLIDER:
+        case ANGLE:
+            type = parameter.type == ANGLE ? "angle" : "slider";
+            minimum = parameter.minFloat;
+            maximum = parameter.maxFloat;
+            step = parameter.stepFloat;
+            break;
+        case INT_SLIDER:
+            type = "slider";
+            minimum = parameter.minInt;
+            maximum = parameter.maxInt;
+            step = parameter.stepInt;
+            break;
+        case UINT8_SLIDER:
+            type = "slider";
+            minimum = parameter.minUInt8;
+            maximum = parameter.maxUInt8;
+            step = parameter.stepUInt8;
+            break;
+        case UINT16_SLIDER:
+            type = "slider";
+            minimum = parameter.minUInt16;
+            maximum = parameter.maxUInt16;
+            step = parameter.stepUInt16;
+            break;
+        case UINT_SLIDER:
+            type = "slider";
+            minimum = parameter.minUInt;
+            maximum = parameter.maxUInt;
+            step = parameter.stepUInt;
+            break;
+        case ULONG_SLIDER:
+            type = "slider";
+            minimum = parameter.minULong;
+            maximum = parameter.maxULong;
+            step = parameter.stepULong;
+            break;
+        case DROPDOWN:
+            type = "dropdown";
+            break;
+        case BUTTON:
+            type = "button";
+            break;
+        case DISPLAY_TEXT:
+            type = "display";
+            break;
+        case LOG_CHART:
+            type = "chart";
+            break;
+        case LOG_RAW:
+            type = "raw";
+            break;
+        default:
+            continue;
+        }
+
+        if (!firstParameter)
+            response += ',';
+        firstParameter = false;
+
+        response += "{\"id\":";
+        response += String(i);
+        response += ",\"name\":";
+        appendJsonString(response, parameter.name);
+        response += ",\"tab\":";
+        appendJsonString(response, parameter.tab.length() ? parameter.tab : String("Main"));
+        response += ",\"category\":";
+        appendJsonString(response, parameter.category);
+        response += ",\"type\":";
+        appendJsonString(response, type);
+
+        double value;
+        if (getPresetParameterValue(parameter, value))
+        {
+            response += ",\"value\":";
+            response += String(value, 6);
+        }
+
+        if (parameter.type == DROPDOWN)
+        {
+            const double currentValue = dropdownCurrentValue(parameter);
+            int selected = -1;
+            for (int option = 0; option < parameter.optionCount; ++option)
+            {
+                if (parameter.optionValues[option] == currentValue)
+                {
+                    selected = option;
+                    break;
+                }
+            }
+
+            response += ",\"selected\":";
+            response += String(selected);
+            response += ",\"options\":[";
+            int labelStart = 0;
+            for (int option = 0; option < parameter.optionCount; ++option)
+            {
+                if (option > 0)
+                    response += ',';
+
+                int labelEnd = parameter.optionLabels.indexOf('\n', labelStart);
+                if (labelEnd < 0)
+                    labelEnd = parameter.optionLabels.length();
+                const String label = parameter.optionLabels.substring(labelStart, labelEnd);
+
+                response += "{\"label\":";
+                appendJsonString(response, label);
+                response += ",\"value\":";
+                response += String(parameter.optionValues[option], 6);
+                response += '}';
+                labelStart = labelEnd + 1;
+            }
+            response += ']';
+        }
+        else if (parameter.type == LOG_CHART || parameter.type == LOG_RAW)
+        {
+            response += ",\"series\":[";
+            int start = 0;
+            while (start < static_cast<int>(parameter.logSeries.length()))
+            {
+                int end = parameter.logSeries.indexOf(',', start);
+                if (end < 0)
+                    end = parameter.logSeries.length();
+                if (start > 0)
+                    response += ',';
+                appendJsonString(response, parameter.logSeries.substring(start, end));
+                start = end + 1;
+            }
+            response += ']';
+            if (parameter.hasChartBounds)
+            {
+                response += ",\"min\":" + String(parameter.chartMinimum, 6);
+                response += ",\"max\":" + String(parameter.chartMaximum, 6);
+            }
+        }
+        else if (parameter.type != BUTTON && parameter.type != DISPLAY_TEXT)
+        {
+            response += ",\"min\":";
+            response += String(minimum, 6);
+            response += ",\"max\":";
+            response += String(maximum, 6);
+            response += ",\"step\":";
+            response += String(step, 6);
+        }
+
+        response += '}';
+    }
+
+    response += "],\"signals\":[";
+    if (_logSource)
+    {
+        for (size_t i = 0; i < _logSource->signalCount(); ++i)
+        {
+            if (i > 0)
+                response += ',';
+            appendJsonString(response, _logSource->signalName(i));
+        }
+    }
+    response += "]}";
     _server.sendHeader("Cache-Control", "no-store");
-    _server.send(200, "text/html", generateHTML());
+    _server.send(200, "application/json", response);
 }
 
 void WiFiTuner::handleUpdate()
@@ -1656,6 +1882,51 @@ void WiFiTuner::handleUpdate()
     }
 
     _server.send(200, "text/plain", "OK");
+}
+
+void WiFiTuner::handlePresetList()
+{
+    if (!_presetStorageReady)
+    {
+        _server.send(503, "text/plain", "Preset storage is unavailable.");
+        return;
+    }
+
+    String response = "{\"presets\":[";
+    bool firstPreset = true;
+    const uint32_t currentSchema = presetSchemaHash();
+    const uint16_t currentCount = presetParameterCount();
+    double values[MAX_PARAMETERS];
+
+    for (uint8_t slot = 0; slot < MAX_PRESETS; ++slot)
+    {
+        const String key = presetKey(slot);
+        if (!_presetPreferences.isKey(key.c_str()))
+            continue;
+
+        String name;
+        uint32_t schemaHash = 0;
+        uint16_t valueCount = 0;
+        const bool valid = readPreset(slot, name, schemaHash, values, valueCount);
+
+        if (!firstPreset)
+            response += ',';
+        firstPreset = false;
+
+        response += "{\"slot\":";
+        response += String(slot);
+        response += ",\"name\":";
+        appendJsonString(response, valid ? name : String("Invalid preset ") + String(slot));
+        response += ",\"compatible\":";
+        response += valid && schemaHash == currentSchema && valueCount == currentCount
+                        ? "true"
+                        : "false";
+        response += '}';
+    }
+
+    response += "]}";
+    _server.sendHeader("Cache-Control", "no-store");
+    _server.send(200, "application/json", response);
 }
 
 void WiFiTuner::handlePresetSave()

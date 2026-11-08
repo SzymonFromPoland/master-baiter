@@ -13,7 +13,11 @@ bool Memory::key_exists(const char *key) { return prefs.isKey(key); }
 // write
 void Memory::write_int(const char *key, int value) { prefs.putInt(key, value); }
 void Memory::write_float(const char *key, float value) { prefs.putFloat(key, value); }
-void Memory::write_bool(const char *key, bool value) { prefs.putBool(key, value); }
+void Memory::write_bool(const char *key, bool value)
+{
+    if (prefs.putBool(key, value) == 0)
+        Serial.printf("[Memory] Failed to save boolean setting '%s'.\n", key ? key : "(null)");
+}
 void Memory::write_uint8(const char *key, uint8_t value) { prefs.putUChar(key, value); }
 void Memory::write_uint16(const char *key, uint16_t value) { prefs.putUShort(key, value); }
 void Memory::write_uint32(const char *key, uint32_t value) { prefs.putUInt(key, value); }
