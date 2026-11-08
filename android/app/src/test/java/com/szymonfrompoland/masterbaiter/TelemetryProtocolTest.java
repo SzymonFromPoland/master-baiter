@@ -76,6 +76,16 @@ public final class TelemetryProtocolTest {
             } catch (IOException expected) {
                 check(expected.getMessage().contains("currently"), "active log delete error");
             }
+            File closedLog = new File(directory, "closed.csv");
+            check(closedLog.createNewFile(), "created closed bulk-delete fixture");
+            try {
+                PhoneRecorder.deleteClosedLogs(directory);
+                throw new AssertionError("Bulk delete removed an active recording");
+            } catch (IOException expected) {
+                check(expected.getMessage().contains("currently"), "active bulk-delete error");
+            }
+            check(files[0].exists() && closedLog.exists(), "active log prevents partial bulk delete");
+            check(closedLog.delete(), "removed closed bulk-delete fixture");
             String contents = new String(Files.readAllBytes(files[0].toPath()), StandardCharsets.UTF_8);
             check(contents.equals("elapsed_ms,sequence,a,b,new_signal\n123,4294967295,1.5,-2.0,9.0\n"),
                     "live CSV content");
@@ -104,6 +114,8 @@ public final class TelemetryProtocolTest {
             recorder.append(decoded.samples[1]);
             recorder.close();
             check(directory.listFiles().length == 1, "new run creates new file");
+            check(PhoneRecorder.deleteClosedLogs(directory) == 1 &&
+                    directory.listFiles().length == 0, "bulk delete removes all closed logs");
         } finally {
             File[] files = directory.listFiles();
             if (files != null) for (File file : files) Files.delete(file.toPath());

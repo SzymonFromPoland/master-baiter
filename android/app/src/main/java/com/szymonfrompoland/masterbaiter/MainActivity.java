@@ -24,6 +24,7 @@ import android.view.GestureDetector;
 import android.view.MotionEvent;
 import android.view.ScaleGestureDetector;
 import android.view.View;
+import android.view.WindowInsets;
 import android.text.InputType;
 import android.widget.AdapterView;
 import android.widget.ArrayAdapter;
@@ -68,6 +69,14 @@ import java.util.concurrent.Executors;
 
 public final class MainActivity extends Activity implements RobotWifiConnection.Listener {
     private static final int EXPORT_REQUEST = 41;
+    private static final int[] CHART_COLORS = {
+            0xff4fc3f7, 0xffffb74d, 0xff81c784, 0xffef5350,
+            0xffba68c8, 0xffffee58, 0xff4db6ac, 0xfff06292,
+            0xff7986cb, 0xffaed581, 0xffff8a65, 0xff90a4ae,
+            0xff9575cd, 0xffdce775, 0xff4dd0e1, 0xffffd54f,
+            0xffa1887f, 0xff64b5f6, 0xffe57373, 0xff80cbc4,
+            0xffc5e1a5, 0xffffcc80, 0xffce93d8, 0xffb0bec5
+    };
 
     private final Handler uiHandler = new Handler(Looper.getMainLooper());
     private final ExecutorService apiExecutor = Executors.newSingleThreadExecutor();
@@ -401,11 +410,22 @@ public final class MainActivity extends Activity implements RobotWifiConnection.
     private void buildUi() {
         LinearLayout root = new LinearLayout(this);
         root.setOrientation(LinearLayout.VERTICAL);
-        root.setPadding(dp(20), dp(12), dp(20), dp(12));
+        int horizontalPadding = dp(20);
+        int topPadding = dp(12);
+        int bottomPadding = dp(12);
+        root.setPadding(horizontalPadding, topPadding, horizontalPadding, bottomPadding);
+        root.setOnApplyWindowInsetsListener((view, insets) -> {
+            int statusBarInset = Build.VERSION.SDK_INT >= Build.VERSION_CODES.R
+                    ? insets.getInsets(WindowInsets.Type.statusBars()).top
+                    : insets.getSystemWindowInsetTop();
+            view.setPadding(horizontalPadding, topPadding + statusBarInset,
+                    horizontalPadding, bottomPadding);
+            return insets;
+        });
         root.setBackgroundColor(Color.rgb(17, 17, 17));
 
         TextView title = new TextView(this);
-        title.setText("Robot Tuner");
+        title.setText("Master Baiter Tuner");
         title.setTextSize(24);
         title.setTextColor(Color.rgb(238, 238, 238));
         title.setTypeface(null, Typeface.BOLD);
@@ -465,6 +485,7 @@ public final class MainActivity extends Activity implements RobotWifiConnection.
         root.addView(scrollView, new LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT, 0, 1.0f));
         setContentView(root);
+        root.requestApplyInsets();
     }
 
     private void addPageButton(String label, boolean selected, Runnable action) {
@@ -1071,12 +1092,18 @@ public final class MainActivity extends Activity implements RobotWifiConnection.
         refresh.setText("Refresh");
         refresh.setOnClickListener(view -> showPage("files"));
         pageBody.addView(refresh);
+        Button deleteAllLogs = new Button(this);
+        deleteAllLogs.setText("Delete all logs");
+        deleteAllLogs.setEnabled(false);
+        deleteAllLogs.setOnClickListener(view -> confirmDeleteAllLogs());
+        pageBody.addView(deleteAllLogs);
 
         try {
             File[] files = logDirectory().listFiles((directory, name) -> name.endsWith(".csv"));
             if (files == null) {
                 throw new IOException("The phone log folder could not be read.");
             }
+            deleteAllLogs.setEnabled(files.length > 0);
             if (files.length == 0) {
                 TextView empty = new TextView(this);
                 empty.setText("No phone log files yet.");
@@ -1141,6 +1168,23 @@ public final class MainActivity extends Activity implements RobotWifiConnection.
                     } catch (IOException exception) {
                         showStatus("Could not delete log: " + errorText(exception));
                     }
+                })
+                .show();
+    }
+
+    private void confirmDeleteAllLogs() {
+        new AlertDialog.Builder(this)
+                .setTitle("Delete all phone logs?")
+                .setMessage("Permanently delete all phone log files from this phone? This cannot be undone. Stop recording first to delete every file.")
+                .setNegativeButton("Cancel", null)
+                .setPositiveButton("Delete all", (dialog, which) -> {
+                    try {
+                        int deleted = PhoneRecorder.deleteClosedLogs(logDirectory());
+                        showStatus("Deleted " + deleted + (deleted == 1 ? " phone log." : " phone logs."));
+                    } catch (IOException exception) {
+                        showStatus("Could not delete all phone logs: " + errorText(exception));
+                    }
+                    showPage("files");
                 })
                 .show();
     }
@@ -1484,6 +1528,10 @@ public final class MainActivity extends Activity implements RobotWifiConnection.
             card.addView(error);
             return;
         }
+        int[] seriesColors = new int[names.size()];
+        for (int i = 0; i < seriesColors.length; i++) {
+            seriesColors[i] = CHART_COLORS[i % CHART_COLORS.length];
+        }
         if ("raw".equals(parameter.optString("type"))) {
             TextView raw = new TextView(this);
             raw.setTextColor(0xff9cff9c);
@@ -1526,7 +1574,7 @@ public final class MainActivity extends Activity implements RobotWifiConnection.
         cursorReadout.setTextSize(12);
         cursorReadout.setBackground(rounded(0xff050505, 6));
         cursorReadout.setPadding(dp(10), dp(8), dp(10), dp(8));
-        ChartView chart = new ChartView(names, live,
+        ChartView chart = new ChartView(names, seriesColors, live,
                 parameter.has("min") ? (float) parameter.optDouble("min") : Float.NaN,
                 parameter.has("max") ? (float) parameter.optDouble("max") : Float.NaN,
                 cursorReadout);
@@ -1543,8 +1591,24 @@ public final class MainActivity extends Activity implements RobotWifiConnection.
         card.addView(chartActions);
         card.addView(cursorReadout);
         TextView legend = new TextView(this);
-        legend.setText(android.text.TextUtils.join("  |  ", names));
+        android.text.SpannableStringBuilder legendText = new android.text.SpannableStringBuilder();
+        for (int i = 0; i < names.size(); i++) {
+            if (i > 0) legendText.append("   ");
+            int markerStart = legendText.length();
+            legendText.append("\u25CF");
+            legendText.setSpan(new android.text.style.ForegroundColorSpan(seriesColors[i]),
+                    markerStart, legendText.length(),
+                    android.text.Spannable.SPAN_EXCLUSIVE_EXCLUSIVE);
+            legendText.append(' ');
+            int labelStart = legendText.length();
+            legendText.append(names.get(i));
+            legendText.setSpan(new android.text.style.ForegroundColorSpan(seriesColors[i]),
+                    labelStart, legendText.length(),
+                    android.text.Spannable.SPAN_EXCLUSIVE_EXCLUSIVE);
+        }
+        legend.setText(legendText);
         legend.setTextColor(0xffbbbbbb);
+        legend.setTextSize(12);
         card.addView(legend);
         TextView gestureHint = new TextView(this);
         gestureHint.setText("Pinch to zoom | Drag to pan | Tap to inspect");
@@ -1764,11 +1828,11 @@ public final class MainActivity extends Activity implements RobotWifiConnection.
         private final int limit;
         private final float fixedMin;
         private final float fixedMax;
+        private final int[] seriesColors;
         private final DecimalFormat axisFormat = new DecimalFormat(
                 "0.######", DecimalFormatSymbols.getInstance(Locale.US));
         private final ScaleGestureDetector scaleGestureDetector;
         private final GestureDetector gestureDetector;
-        private final int[] colors = {0xff4fc3f7, 0xffffb74d, 0xff81c784, 0xffef9a9a};
         private float zoom = 1f;
         private float offset;
         private float downX;
@@ -1779,10 +1843,11 @@ public final class MainActivity extends Activity implements RobotWifiConnection.
         private boolean hasCursor;
         private long cursorElapsedMs;
 
-        ChartView(List<String> names, boolean live, float minimum, float maximum,
+        ChartView(List<String> names, int[] seriesColors, boolean live, float minimum, float maximum,
                   TextView cursorReadout) {
             super(MainActivity.this);
             seriesNames = new ArrayList<>(names);
+            this.seriesColors = seriesColors.clone();
             this.cursorReadout = cursorReadout;
             limit = live ? 2001 : 2000;
             fixedMin = minimum;
@@ -2103,7 +2168,7 @@ public final class MainActivity extends Activity implements RobotWifiConnection.
             paint.setStyle(Paint.Style.STROKE);
             paint.setStrokeWidth(dp(2));
             for (int series = 0; series < seriesNames.size(); series++) {
-                paint.setColor(colors[series % colors.length]);
+                paint.setColor(seriesColors[series]);
                 Path path = new Path();
                 boolean previous = false;
                 for (int i = start; i < end; i++) {
@@ -2134,7 +2199,7 @@ public final class MainActivity extends Activity implements RobotWifiConnection.
                     if (!Float.isFinite(value)) continue;
                     float y = pointY(value, minimum, maximum, top, bottom);
                     if (y >= top && y <= bottom) {
-                        paint.setColor(colors[series % colors.length]);
+                        paint.setColor(seriesColors[series]);
                         canvas.drawCircle(cursorX, y, dp(4), paint);
                     }
                 }

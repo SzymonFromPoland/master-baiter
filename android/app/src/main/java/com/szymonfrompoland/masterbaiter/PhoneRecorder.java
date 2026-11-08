@@ -95,6 +95,29 @@ final class PhoneRecorder implements AutoCloseable {
         }
     }
 
+    static int deleteClosedLogs(File directory) throws IOException {
+        synchronized (FILE_LOCK) {
+            File[] files = directory.listFiles((parent, name) -> name.endsWith(".csv"));
+            if (files == null) {
+                throw new IOException("The phone log folder could not be read.");
+            }
+            for (File file : files) {
+                if (OPEN_FILES.contains(file)) {
+                    throw new IOException("A log is currently being recorded. Stop the robot or disable Logging before deleting all logs.");
+                }
+            }
+            int deleted = 0;
+            for (File file : files) {
+                if (!file.delete()) {
+                    throw new IOException("Could not delete " + file.getName() + "; " + deleted +
+                            " earlier log(s) may already have been deleted.");
+                }
+                deleted++;
+            }
+            return deleted;
+        }
+    }
+
     static File renameClosedLog(File file, String name) throws IOException {
         String trimmed = name.trim();
         if (trimmed.isEmpty() || trimmed.equals(".") || trimmed.equals("..") ||

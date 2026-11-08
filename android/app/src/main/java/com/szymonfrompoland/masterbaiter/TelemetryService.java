@@ -255,7 +255,7 @@ public final class TelemetryService extends Service {
         Notification.Builder builder = Build.VERSION.SDK_INT >= Build.VERSION_CODES.O
                 ? new Notification.Builder(this, CHANNEL) : new Notification.Builder(this);
         return builder.setSmallIcon(android.R.drawable.stat_sys_data_bluetooth)
-                .setContentTitle("Robot Tuner").setContentText(message)
+                .setContentTitle("Master Baiter Tuner").setContentText(message)
                 .setContentIntent(pending).setOngoing(true).build();
     }
 

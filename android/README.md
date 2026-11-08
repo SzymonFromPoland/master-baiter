@@ -1,4 +1,4 @@
-# Robot Tuner Android app
+# Master Baiter Tuner Android app
 
 The APK contains the phone UI. The robot provides a small HTTP control API and
 a batched TCP telemetry stream; it no longer serves the tuner HTML or writes
@@ -17,7 +17,7 @@ The APK is written to `app\build\outputs\apk\debug\app-debug.apk`.
 
 ## Connect and record
 
-1. Open Robot Tuner and press **Connect**. The app requests the robot's
+1. Open Master Baiter Tuner and press **Connect**. The app requests the robot's
    **Robot-Tuner** Wi-Fi network by name, then Android may ask you to approve
    joining it. Enter the Wi-Fi password the first time; the app encrypts it
    with Android Keystore and reuses it on later connections.

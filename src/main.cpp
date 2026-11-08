@@ -1,6 +1,6 @@
 #include <Arduino.h>
 #include <Wire.h>
-#include <VL53L1X_ULD.h>
+#include <vl53l1x_class.h>
 
 #include <tuner.h>
 #include <telemetry.h>
@@ -16,6 +16,9 @@
 #include <esp_system.h>
 
 const uint8_t sensor_count = 5;
+const uint16_t sensor_timing_budget_ms = 15;
+const uint16_t sensor_inter_measurement_ms = 15;
+const uint32_t sensor_stale_timeout_ms = sensor_inter_measurement_ms * 3U;
 const uint8_t receiver_pin = 14;
 const uint8_t flag_pin = 4;
 
@@ -39,10 +42,44 @@ const uint8_t xs_pins[5] = {
     10, // sensor 4
     9   // sensor 5
 };
-const uint8_t sensor_addresses[sensor_count] = {0x2A, 0x2C, 0x2E, 0x30, 0x32};
+const uint8_t sensor_addresses[sensor_count] = {0x2A, 0x2C, 0x2E, 0x30, 0x32}; // STM32duino API uses 8-bit addresses.
 
-VL53L1X_ULD sensors[sensor_count];
-VL53L1X_Result_t results[sensor_count];
+class VL53L1XWideSignalRate : public VL53L1X
+{
+public:
+  using VL53L1X::VL53L1X;
+
+  VL53L1X_ERROR VL53L1X_GetSignalRateWide(uint32_t *signalRate)
+  {
+    uint16_t rawSignalRate = 0;
+    const VL53L1X_ERROR status = VL53L1X_RdWord(
+        Device,
+        VL53L1X_RESULT__PEAK_SIGNAL_COUNT_RATE_CROSSTALK_CORRECTED_MCPS_SD0,
+        &rawSignalRate);
+    if (status == VL53L1X_ERROR_NONE)
+      *signalRate = static_cast<uint32_t>(rawSignalRate) * 8U;
+    return status;
+  }
+};
+
+VL53L1XWideSignalRate sensor0(&Wire, xs_pins[0]);
+VL53L1XWideSignalRate sensor1(&Wire, xs_pins[1]);
+VL53L1XWideSignalRate sensor2(&Wire, xs_pins[2]);
+VL53L1XWideSignalRate sensor3(&Wire, xs_pins[3]);
+VL53L1XWideSignalRate sensor4(&Wire, xs_pins[4]);
+VL53L1XWideSignalRate *sensors[sensor_count] = {&sensor0, &sensor1, &sensor2, &sensor3, &sensor4};
+
+struct SensorResult
+{
+  uint8_t Status;
+  uint16_t Distance;
+  uint32_t SigPerSPAD;
+  uint16_t NumSPADs;
+};
+
+SensorResult results[sensor_count] = {};
+uint32_t sensor_sample_time_ms[sensor_count] = {};
+bool sensor_sample_valid[sensor_count] = {};
 bool sensors_en = true;
 
 Gyro mpu6050;
@@ -116,10 +153,17 @@ uint8_t stop_command = 0x00;
 bool started = false;
 bool logging_en = false;
 
-float distance = 0;
-float signal_spad = 0;
-long long signal_index = 0;
+uint32_t flag_det_thr = 0;
+bool flag_det_en = false;
+
 float dt_ms = 0.0f;
+
+uint16_t distance[sensor_count];
+uint32_t signal_spad[sensor_count];
+uint64_t signal_index[sensor_count];
+
+float distance_norm[sensor_count];
+float signal_spad_norm[sensor_count];
 
 void set_started(bool state)
 {
@@ -132,35 +176,35 @@ void set_started(bool state)
   started = state;
 }
 
-bool init_sensor(VL53L1X_ULD &sensor, uint8_t address, uint8_t xshut)
+bool init_sensor(VL53L1X &sensor, uint8_t address)
 {
-  digitalWrite(xshut, HIGH);
-  delay(50);
-  if (sensor.Begin(address) != VL53L1_ERROR_NONE)
-    return false;
-
-  if (sensor.SetI2CAddress(address) != VL53L1_ERROR_NONE)
-    return false;
-  delay(10);
-
-  return true;
+  return sensor.begin() == 0 && sensor.InitSensor(address) == VL53L1X_ERROR_NONE;
 }
 
-void set_sensor_settings(VL53L1X_ULD &sensor, EDistanceMode mode, uint16_t roi[2], uint16_t timing_budget, uint16_t inter_measurement, uint16_t threshold)
+bool set_sensor_settings(VL53L1X &sensor, uint16_t roi[2], uint16_t timing_budget, uint16_t inter_measurement)
 {
-  sensor.SetDistanceMode(mode);
-  sensor.SetROI(roi[0], roi[1]);
-  sensor.SetTimingBudgetInMs(timing_budget);
-  sensor.SetInterMeasurementInMs(inter_measurement);
-  sensor.SetInterruptPolarity(ActiveLOW);
-  sensor.SetDistanceThreshold(0, threshold, Out);
-  sensor.StartRanging();
+  return sensor.VL53L1X_SetDistanceMode(1) == VL53L1X_ERROR_NONE && sensor.VL53L1X_SetROI(roi[0], roi[1]) == VL53L1X_ERROR_NONE && sensor.VL53L1X_SetTimingBudgetInMs(timing_budget) == VL53L1X_ERROR_NONE && sensor.VL53L1X_SetInterMeasurementInMs(inter_measurement) == VL53L1X_ERROR_NONE && sensor.VL53L1X_SetInterruptPolarity(0) == VL53L1X_ERROR_NONE && sensor.VL53L1X_StartRanging() == VL53L1X_ERROR_NONE;
+}
+
+bool read_sensor_result(VL53L1XWideSignalRate &sensor, SensorResult &result)
+{
+  return sensor.VL53L1X_GetDistance(&result.Distance) == VL53L1X_ERROR_NONE && sensor.VL53L1X_GetRangeStatus(&result.Status) == VL53L1X_ERROR_NONE && sensor.VL53L1X_GetSignalRateWide(&result.SigPerSPAD) == VL53L1X_ERROR_NONE && sensor.VL53L1X_GetSpadNb(&result.NumSPADs) == VL53L1X_ERROR_NONE;
 }
 
 uint16_t roi[2] = {13, 6}; // 13x4
 
-const char *ssid = "TP-Link_B754";
-const char *password = "05368129";
+void invalidate_sensor_result(uint8_t sensorIndex)
+{
+  results[sensorIndex].Distance = threshold1;
+  results[sensorIndex].Status = 255;
+  distance[sensorIndex] = threshold1;
+  sensor_sample_valid[sensorIndex] = false;
+  if (sensorIndex == 2)
+  {
+    results[sensorIndex].SigPerSPAD = 0;
+    results[sensorIndex].NumSPADs = 0;
+  }
+}
 
 void setup()
 {
@@ -188,10 +232,12 @@ void setup()
 
   for (uint8_t i = 0; i < sensor_count; i++)
   {
-    if (!init_sensor(sensors[i], sensor_addresses[i], xs_pins[i]))
+    if (!init_sensor(*sensors[i], sensor_addresses[i]))
       while (1)
         ;
-    set_sensor_settings(sensors[i], Short, roi, 15, 15, threshold1);
+    if (!set_sensor_settings(*sensors[i], roi, sensor_timing_budget_ms, sensor_inter_measurement_ms))
+      while (1)
+        ;
   }
 
   if (mpu6050.begin())
@@ -213,6 +259,9 @@ void setup()
   current_mode = mode = memory.read_int("mode", mode);
   weights_en = memory.read_bool("weights_en", weights_en);
   logging_en = memory.read_bool("logging_en", logging_en);
+
+  flag_det_thr = memory.read_float("flag_det_thr", flag_det_thr);
+  flag_det_en = memory.read_bool("flag_det_en", flag_det_en);
 
   panic_slow = memory.read_ulong("panic_slow", panic_slow);
   panic_fast = memory.read_ulong("panic_fast", panic_fast);
@@ -238,6 +287,12 @@ void setup()
   threshold1 = memory.read_uint16("thres1", threshold1);
   threshold2 = memory.read_uint16("thres2", threshold2);
   threshold3 = memory.read_uint16("thres3", threshold3);
+  for (uint8_t i = 0; i < sensor_count; i++)
+  {
+    results[i].Distance = threshold1;
+    results[i].Status = 255;
+    distance[i] = threshold1;
+  }
   en_slow_down = memory.read_bool("en_slow_down", en_slow_down);
 
   strength_fast = memory.read_float("strength_fast", strength_fast);
@@ -258,13 +313,18 @@ void setup()
   // Loop count, not milliseconds: sample once per main-loop iteration.
   telemetry.setSampleIntervalLoops(1);
   telemetry.add("sensors_error", &sensors_error);
-  telemetry.add("signal_index", &signal_index);
-  telemetry.add("signal_spad", &signal_spad);
-  telemetry.add("distance", &distance);
   telemetry.add("gyro_error", &gyro_error);
   telemetry.add("left_speed", &left_speed);
   telemetry.add("right_speed", &right_speed);
   telemetry.add("dt_ms", &dt_ms);
+  telemetry.add("distance0", &distance[0]);
+  telemetry.add("distance1", &distance[1]);
+  telemetry.add("distance2", &distance[2]);
+  telemetry.add("distance3", &distance[3]);
+  telemetry.add("distance4", &distance[4]);
+  telemetry.add("distance_norm2", &distance_norm[2]);
+  telemetry.add("signal_spad_norm2", &signal_spad_norm[2]);
+  telemetry.add("signal_index2", &signal_index[2]);
 
   tuner.setTelemetry(telemetry);
   tuner.addTab("Control");
@@ -277,6 +337,10 @@ void setup()
                   { mpu6050.enable(); mpu6050.callibrate(); });
   tuner.addButton("Test flag", []
                   { flag.test(); });
+  tuner.addSlider("Flag detection threshold", &flag_det_thr, 0U, 250000U, 250U, [](uint32_t value)
+                  { memory.write_uint32("flag_det_thr", value); });
+  tuner.addDropdown("Flag detection", &flag_det_en, {"OFF", "ON"}, {false, true}, [](bool value)
+                    { memory.write_bool("flag_det_en", value); });
   tuner.addDropdown("Logging", &logging_en, {"OFF", "ON"}, {false, true}, [](bool value)
                     { memory.write_bool("logging_en", value); });
 
@@ -296,8 +360,9 @@ void setup()
   tuner.addCategory("Saved data");
   tuner.addChart("sensors_error", telemetry, {"sensors_error"}, -50.0f, 50.0f);
   tuner.addChart("gyro_error", telemetry, {"gyro_error"}, -1025.0f, 1025.0f);
-  tuner.addChart("signal_index", telemetry, {"signal_index"}, 0, 400000000);
-  tuner.addChart("signal_spad/distance", telemetry, {"signal_spad", "distance"}, 0.0f, 1.0f);
+  tuner.addChart("distances", telemetry, {"distance0", "distance1", "distance2", "distance3", "distance4"}, 0.0f, 1000.0f);
+  tuner.addChart("signal_index2", telemetry, {"signal_index2"}, 0, 250000);
+  tuner.addChart("signal_spad2/distance2", telemetry, {"signal_spad_norm2", "distance_norm2"}, 0.0f, 1.0f);
   tuner.addChart("motor_speeds", telemetry, {"left_speed", "right_speed"}, -1023.0f, 1023.0f);
   tuner.addChart("dt_ms", telemetry, {"dt_ms"}, 0.0f, 100.0f);
   tuner.addCategory("Status");
@@ -448,23 +513,48 @@ void loop()
     float denominator = 0.0f;
     uint16_t smallest_distance = threshold1;
     bool target_detected = false;
+    const uint32_t sensorNowMs = millis();
 
     for (int i = 0; i < sensor_count; i++)
     {
-      if (sensors[i].GetResult(&results[i]) != VL53L1_ERROR_NONE)
+      uint8_t isDataReady = 0;
+      const bool readyCheckSucceeded = sensors[i]->VL53L1X_CheckForDataReady(&isDataReady) == VL53L1X_ERROR_NONE;
+
+      if (readyCheckSucceeded && isDataReady)
       {
-        results[i].Distance = threshold1;
+        SensorResult newResult = {};
+        const bool resultRead = read_sensor_result(*sensors[i], newResult);
+        const bool interruptCleared = sensors[i]->VL53L1X_ClearInterrupt() == VL53L1X_ERROR_NONE;
+        if (resultRead && interruptCleared)
+        {
+          results[i] = newResult;
+          sensor_sample_time_ms[i] = sensorNowMs;
+          sensor_sample_valid[i] = true;
+        }
+      }
+
+      if (!sensor_sample_valid[i] || sensorNowMs - sensor_sample_time_ms[i] >= sensor_stale_timeout_ms)
+      {
+        invalidate_sensor_result(i);
         continue;
       }
 
-      if (results[i].Status == 0)
+      signal_index[i] = static_cast<uint64_t>(static_cast<uint64_t>(results[i].SigPerSPAD) / (results[i].NumSPADs > 0 ? results[i].NumSPADs : 1U));
+      const bool flag_detected = signal_index[i] > flag_det_thr && flag_det_en;
+
+      if (results[i].Status == 0 && !flag_detected)
       {
         results[i].Distance = min(results[i].Distance, threshold1);
         smallest_distance = min(smallest_distance, results[i].Distance);
 
+        distance[i] = results[i].Distance;
+        signal_spad[i] = results[i].SigPerSPAD;
+
+        distance_norm[i] = static_cast<float>(static_cast<float>(min(results[i].Distance, threshold1))) / static_cast<float>(threshold1);
+        signal_spad_norm[i] = static_cast<float>(results[i].SigPerSPAD) / 400000.0f;
+
         if (results[i].Distance < threshold1)
         {
-          sensors[i].ClearInterrupt();
           target_detected = true;
 
           const float s = 1.0f / max((float)results[i].Distance, 1.0f);
@@ -482,12 +572,9 @@ void loop()
       else
       {
         results[i].Distance = threshold1;
+        distance[i] = threshold1;
       }
     }
-
-    signal_index = (long long)((results[2].SigPerSPAD * (results[2].Distance > 0 ? (results[2].Distance * results[2].Distance) : 1)) / (results[2].NumSPADs > 0 ? results[2].NumSPADs : 1));
-    signal_spad = (float)results[2].SigPerSPAD / 65535.0f;
-    distance = threshold1 > 0 ? (float)min(results[2].Distance, threshold1) / threshold1 : 0.0f;
 
     sensors_error = (denominator > 0.0001f) ? numerator / denominator : 0.0f;
     sensors_strength = target_detected && distance_strength > 0.0f ? distance_strength / (distance_strength + (float)smallest_distance) : 0.0f;
