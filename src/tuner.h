@@ -3,7 +3,6 @@
 #include <Arduino.h>
 #include <WiFi.h>
 #include <WebServer.h>
-#include <Preferences.h>
 #include <stdarg.h>
 #include <initializer_list>
 
@@ -172,7 +171,6 @@ public:
 
 private:
     WebServer _server;
-    Preferences _presetPreferences;
 
     enum ParameterType
     {
@@ -258,9 +256,6 @@ private:
     static constexpr int MAX_PARAMETERS = 64;
     static constexpr int DISPLAY_BUFFER_SIZE = 4096;
     static constexpr int DISPLAY_PRINTF_BUFFER_SIZE = 512;
-    static constexpr uint8_t MAX_PRESETS = 32;
-    static constexpr uint8_t NO_PRESET = 0xFF;
-    static constexpr size_t MAX_PRESET_NAME_LENGTH = 32;
 
     Parameter _parameters[MAX_PARAMETERS];
     int _parameterCount;
@@ -274,18 +269,12 @@ private:
     unsigned long _notificationStartedUs;
     unsigned long _notificationDurationUs;
     bool _notificationActive;
-    bool _presetStorageReady;
     bool _stationMode;
 
-    void initializePresetStorage();
     void configureServer();
     void handleRoot();
     void handleSchema();
     void handleUpdate();
-    void handlePresetList();
-    void handlePresetSave();
-    void handlePresetLoad();
-    void handlePresetDelete();
     void handleButton();
     void handleDisplay();
     void handleNotification();
@@ -304,26 +293,9 @@ private:
         std::initializer_list<T> values);
 
     double dropdownCurrentValue(const Parameter &parameter) const;
+    bool getParameterValue(const Parameter &parameter, double &value) const;
     bool setDropdownOption(Parameter &parameter, int optionIndex);
     bool applyParameterValue(Parameter &parameter, double value);
-    bool isPresetParameter(const Parameter &parameter) const;
-    bool getPresetParameterValue(const Parameter &parameter, double &value) const;
-    bool isValidPresetValue(const Parameter &parameter, double value) const;
-    uint16_t presetParameterCount() const;
-    uint32_t presetSchemaHash() const;
-    String presetKey(uint8_t slot) const;
-    bool parsePresetSlot(const String &text, uint8_t &slot) const;
-    bool readPreset(
-        uint8_t slot,
-        String &name,
-        uint32_t &schemaHash,
-        double *values,
-        uint16_t &valueCount);
-    bool findPresetByName(const String &name, uint8_t &slot);
-    bool storePreset(const String &name, uint8_t &slot, int &statusCode, String &error);
-    bool applyPreset(uint8_t slot, bool remember, int &statusCode, String &error);
-    void restoreLastPreset();
-    String presetManagerHTML();
 
     bool addLogView(
         const char *title,

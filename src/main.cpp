@@ -120,6 +120,7 @@ unsigned long arc_stop = 0;
 
 unsigned long panic_slow = 0;
 unsigned long panic_fast = 0;
+unsigned long detect_time = 0;
 
 float current_speed = 0.0f;
 float fast_speed = 800.0f;
@@ -209,10 +210,12 @@ void invalidate_sensor_result(uint8_t sensorIndex)
 void setup()
 {
 
+  // Serial.begin(115200);
+
   esp_task_wdt_init(30, false);
   enableLoopWDT();
 
-  Wire.begin(5, 6, 300000);
+  Wire.begin(5, 6, 400000);
 
   flag.begin(flag_pin, 95, 200);
 
@@ -260,11 +263,12 @@ void setup()
   weights_en = memory.read_bool("weights_en", weights_en);
   logging_en = memory.read_bool("logging_en", logging_en);
 
-  flag_det_thr = memory.read_float("flag_det_thr", flag_det_thr);
+  flag_det_thr = memory.read_uint32("flag_det_thr", flag_det_thr);
   flag_det_en = memory.read_bool("flag_det_en", flag_det_en);
 
   panic_slow = memory.read_ulong("panic_slow", panic_slow);
   panic_fast = memory.read_ulong("panic_fast", panic_fast);
+  detect_time = memory.read_ulong("detect_time", detect_time);
 
   arc_angle = memory.read_float("arc_angle", arc_angle);
   arc_diff = memory.read_float("arc_diff", arc_diff);
@@ -313,15 +317,15 @@ void setup()
   // Loop count, not milliseconds: sample once per main-loop iteration.
   telemetry.setSampleIntervalLoops(1);
   telemetry.add("sensors_error", &sensors_error);
-  telemetry.add("gyro_error", &gyro_error);
+  // telemetry.add("gyro_error", &gyro_error);
   telemetry.add("left_speed", &left_speed);
   telemetry.add("right_speed", &right_speed);
   telemetry.add("dt_ms", &dt_ms);
-  telemetry.add("distance0", &distance[0]);
-  telemetry.add("distance1", &distance[1]);
-  telemetry.add("distance2", &distance[2]);
-  telemetry.add("distance3", &distance[3]);
-  telemetry.add("distance4", &distance[4]);
+  // telemetry.add("distance0", &distance[0]);
+  // telemetry.add("distance1", &distance[1]);
+  // telemetry.add("distance2", &distance[2]);
+  // telemetry.add("distance3", &distance[3]);
+  // telemetry.add("distance4", &distance[4]);
   telemetry.add("distance_norm2", &distance_norm[2]);
   telemetry.add("signal_spad_norm2", &signal_spad_norm[2]);
   telemetry.add("signal_index2", &signal_index[2]);
@@ -345,6 +349,9 @@ void setup()
                     { memory.write_bool("logging_en", value); });
 
   tuner.addCategory("Safety");
+
+  tuner.addSlider("Detect time [ ms ]", &panic_slow, 0UL, 1000UL, 10UL, [](unsigned long value)
+                  { memory.write_ulong("detect_time", value); });
   tuner.addSlider("Panic slow [ ms ]", &panic_slow, 0UL, 10000UL, 100UL, [](unsigned long value)
                   { memory.write_ulong("panic_slow", value); });
   tuner.addSlider("Panic fast [ ms ]", &panic_fast, 0UL, 10000UL, 100UL, [](unsigned long value)
@@ -359,8 +366,8 @@ void setup()
   tuner.addTab("Logs");
   tuner.addCategory("Saved data");
   tuner.addChart("sensors_error", telemetry, {"sensors_error"}, -50.0f, 50.0f);
-  tuner.addChart("gyro_error", telemetry, {"gyro_error"}, -1025.0f, 1025.0f);
-  tuner.addChart("distances", telemetry, {"distance0", "distance1", "distance2", "distance3", "distance4"}, 0.0f, 1000.0f);
+  // tuner.addChart("gyro_error", telemetry, {"gyro_error"}, -1025.0f, 1025.0f);
+  // tuner.addChart("distances", telemetry, {"distance0", "distance1", "distance2", "distance3", "distance4"}, 0.0f, 1000.0f);
   tuner.addChart("signal_index2", telemetry, {"signal_index2"}, 0, 250000);
   tuner.addChart("signal_spad2/distance2", telemetry, {"signal_spad_norm2", "distance_norm2"}, 0.0f, 1.0f);
   tuner.addChart("motor_speeds", telemetry, {"left_speed", "right_speed"}, -1023.0f, 1023.0f);
@@ -451,6 +458,7 @@ unsigned long TURN_START_TIME = 0;
 unsigned long ARCH_PANIC_TIME = 0;
 unsigned long PANIC_TIME = 0;
 unsigned long IDLE_TIME = 0;
+unsigned long DETECTED_TIME = 0;
 
 const float sensorAngles[sensor_count] = {-50.0f, -24.0f, 0.0f, 24.0f, 50.0f};
 
@@ -459,6 +467,7 @@ void loop()
   unsigned long now = micros();
   float dt = get_dt(now);
   dt_ms = dt * 1000.0f;
+  // Serial.println(dt_ms, 3);
 
   remote.handle();
   tuner.handle();
@@ -765,7 +774,11 @@ void loop()
 
     distance_strength = strength_fast;
     mpu6050.enable();
-    if (any_under_theshold2 && started)
+
+    if (!any_under_theshold3 || !started)
+      DETECTED_TIME = now;
+
+    if (now - DETECTED_TIME > detect_time * 1000UL && started)
     {
       current_speed = fast_speed;
       current_mode = 1;

@@ -165,8 +165,6 @@ public final class MainActivity extends Activity implements RobotWifiConnection.
     private Button connectButton;
     private TextView statusView;
     private TextView logsMetrics;
-    private Spinner presetSpinner;
-    private EditText presetNameInput;
     private LinearLayout tabButtons;
     private final Object chartsLock = new Object();
     private final List<LiveChart> liveCharts = new ArrayList<>();
@@ -179,7 +177,6 @@ public final class MainActivity extends Activity implements RobotWifiConnection.
 
     private JSONObject schema;
     private final List<JSONObject> parameters = new ArrayList<>();
-    private final List<JSONObject> presets = new ArrayList<>();
     private String selectedControlTab;
     private String currentPage = "controls";
     private String lastNotificationPollError;
@@ -218,193 +215,6 @@ public final class MainActivity extends Activity implements RobotWifiConnection.
                     .setPositiveButton("Dismiss", (dialog, which) -> runApiAction("/notification/cancel"))
                     .show();
         }
-    }
-
-    private void buildPresetManager() {
-        pageBody.addView(sectionTitle("Presets"));
-
-        presetNameInput = new EditText(this);
-        presetNameInput.setSingleLine(true);
-        presetNameInput.setHint("Preset name");
-        presetNameInput.setMaxLines(1);
-        pageBody.addView(presetNameInput);
-
-        List<String> labels = new ArrayList<>();
-        for (JSONObject preset : presets) {
-            String label = preset.optString("name", "Unnamed preset");
-            if (!preset.optBoolean("compatible", false)) {
-                label += " (incompatible)";
-            }
-            labels.add(label);
-        }
-        if (labels.isEmpty()) {
-            labels.add("No saved presets");
-        }
-
-        presetSpinner = new Spinner(this);
-        ArrayAdapter<String> adapter = new ArrayAdapter<>(
-                this, android.R.layout.simple_spinner_item, labels);
-        adapter.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item);
-        presetSpinner.setAdapter(adapter);
-        pageBody.addView(presetSpinner, new LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT, dp(56)));
-
-        LinearLayout buttons = new LinearLayout(this);
-        buttons.setOrientation(LinearLayout.HORIZONTAL);
-
-        Button save = new Button(this);
-        save.setText("Save");
-        save.setOnClickListener(view -> savePreset());
-        buttons.addView(save, new LinearLayout.LayoutParams(0, dp(52), 1.0f));
-
-        Button load = new Button(this);
-        load.setText("Load");
-        load.setEnabled(!presets.isEmpty());
-        load.setOnClickListener(view -> loadSelectedPreset());
-        buttons.addView(load, new LinearLayout.LayoutParams(0, dp(52), 1.0f));
-
-        Button delete = new Button(this);
-        delete.setText("Delete");
-        delete.setEnabled(!presets.isEmpty());
-        delete.setOnClickListener(view -> confirmDeletePreset());
-        buttons.addView(delete, new LinearLayout.LayoutParams(0, dp(52), 1.0f));
-        pageBody.addView(buttons);
-
-        Button refresh = new Button(this);
-        refresh.setText("Refresh presets");
-        refresh.setOnClickListener(view -> refreshPresets());
-        pageBody.addView(refresh);
-    }
-
-    private void refreshPresets() {
-        final String requestedHost = host;
-        if (requestedHost == null) {
-            return;
-        }
-        apiExecutor.execute(() -> {
-            try {
-                JSONObject response = new JSONObject(requestText(requestedHost, "/presets"));
-                JSONArray entries = response.getJSONArray("presets");
-                List<JSONObject> receivedPresets = new ArrayList<>();
-                for (int i = 0; i < entries.length(); i++) {
-                    receivedPresets.add(entries.getJSONObject(i));
-                }
-                uiHandler.post(() -> {
-                    if (!requestedHost.equals(host)) {
-                        return;
-                    }
-                    presets.clear();
-                    presets.addAll(receivedPresets);
-                    if ("controls".equals(currentPage) && "Control".equals(selectedControlTab)) {
-                        showPage("controls");
-                    }
-                });
-            } catch (Exception exception) {
-                uiHandler.post(() -> showStatus("Could not load presets: " + errorText(exception)));
-            }
-        });
-    }
-
-    private void savePreset() {
-        if (presetNameInput == null || host == null) {
-            return;
-        }
-        String name = presetNameInput.getText().toString().trim();
-        if (name.isEmpty()) {
-            showStatus("Enter a preset name before saving.");
-            return;
-        }
-
-        final String requestedHost = host;
-        apiExecutor.execute(() -> {
-            try {
-                requestText(
-                        requestedHost,
-                        "/presets/save",
-                        "POST",
-                        "name=" + URLEncoder.encode(name, "UTF-8"));
-                uiHandler.post(() -> showStatus("Preset saved."));
-                refreshPresets();
-            } catch (Exception exception) {
-                uiHandler.post(() -> showStatus("Could not save preset: " + errorText(exception)));
-            }
-        });
-    }
-
-    private JSONObject selectedPreset() {
-        if (presetSpinner == null) {
-            return null;
-        }
-        int position = presetSpinner.getSelectedItemPosition();
-        return position >= 0 && position < presets.size() ? presets.get(position) : null;
-    }
-
-    private void loadSelectedPreset() {
-        JSONObject preset = selectedPreset();
-        if (preset == null) {
-            showStatus("Select a saved preset first.");
-            return;
-        }
-        if (!preset.optBoolean("compatible", false)) {
-            showStatus("This preset does not match the robot's current controls.");
-            return;
-        }
-
-        final String requestedHost = host;
-        final int slot = preset.optInt("slot", -1);
-        apiExecutor.execute(() -> {
-            try {
-                requestText(requestedHost, "/presets/load", "POST", "slot=" + slot);
-                JSONObject updatedSchema = new JSONObject(requestText(requestedHost, "/api/schema"));
-                JSONArray updatedParameters = updatedSchema.getJSONArray("parameters");
-                List<JSONObject> updatedControls = new ArrayList<>();
-                for (int i = 0; i < updatedParameters.length(); i++) {
-                    updatedControls.add(updatedParameters.getJSONObject(i));
-                }
-                uiHandler.post(() -> {
-                    schema = updatedSchema;
-                    parameters.clear();
-                    parameters.addAll(updatedControls);
-                    loggingEnabled = readLoggingEnabled(updatedControls);
-                    selectedControlTab = "Control";
-                    showStatus("Preset loaded.");
-                    showPage("controls");
-                });
-                refreshPresets();
-            } catch (Exception exception) {
-                uiHandler.post(() -> showStatus("Could not load preset: " + errorText(exception)));
-            }
-        });
-    }
-
-    private void confirmDeletePreset() {
-        JSONObject preset = selectedPreset();
-        if (preset == null) {
-            showStatus("Select a saved preset first.");
-            return;
-        }
-        new AlertDialog.Builder(this)
-                .setMessage("Delete \"" + preset.optString("name", "preset") + "\"?")
-                .setNegativeButton("Cancel", null)
-                .setPositiveButton("Delete", (dialog, which) -> deleteSelectedPreset(preset.optInt("slot", -1)))
-                .show();
-    }
-
-    private void deleteSelectedPreset(int slot) {
-        final String requestedHost = host;
-        if (requestedHost == null || slot < 0) {
-            showStatus("Select a valid preset first.");
-            return;
-        }
-        apiExecutor.execute(() -> {
-            try {
-                requestText(requestedHost, "/presets/delete", "POST", "slot=" + slot);
-                uiHandler.post(() -> showStatus("Preset deleted."));
-                refreshPresets();
-            } catch (Exception exception) {
-                uiHandler.post(() -> showStatus("Could not delete preset: " + errorText(exception)));
-            }
-        });
     }
 
     private void buildUi() {
@@ -601,7 +411,6 @@ public final class MainActivity extends Activity implements RobotWifiConnection.
         host = enteredHost;
         schema = null;
         parameters.clear();
-        presets.clear();
         signalNames = Collections.emptyList();
         selectedControlTab = null;
         pendingWifiPassphrase = passphrase;
@@ -684,7 +493,6 @@ public final class MainActivity extends Activity implements RobotWifiConnection.
                     connectButton.setEnabled(true);
                     showStatus("Connected to robot API. Opening live data...");
                     showPage(currentPage);
-                    refreshPresets();
                     uiHandler.removeCallbacks(notificationPoller);
                     uiHandler.post(notificationPoller);
                     if (startStream) {
@@ -834,10 +642,6 @@ public final class MainActivity extends Activity implements RobotWifiConnection.
         }
 
         rebuildTabs();
-
-        if ("Control".equals(selectedControlTab)) {
-            buildPresetManager();
-        }
 
         if (!loggingEnabled) {
             for (JSONObject parameter : parameters) {

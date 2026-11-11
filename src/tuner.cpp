@@ -5,57 +5,10 @@
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include <string.h>
 
 namespace
 {
-constexpr uint32_t PRESET_MAGIC = 0x50525354;
-constexpr uint16_t PRESET_VERSION = 1;
-constexpr const char *PRESET_LAST_KEY = "last";
 constexpr unsigned long HOME_WIFI_CONNECT_TIMEOUT_MS = 15000;
-
-struct PresetStorageHeader
-{
-    uint32_t magic;
-    uint32_t schemaHash;
-    uint16_t version;
-    uint16_t nameLength;
-    uint16_t valueCount;
-    uint16_t reserved;
-};
-
-static_assert(sizeof(PresetStorageHeader) == 16, "Unexpected preset header layout");
-
-String escapeHtml(const String &value)
-{
-    String escaped;
-    escaped.reserve(value.length());
-    for (size_t i = 0; i < value.length(); ++i)
-    {
-        switch (value[i])
-        {
-        case '&':
-            escaped += "&amp;";
-            break;
-        case '<':
-            escaped += "&lt;";
-            break;
-        case '>':
-            escaped += "&gt;";
-            break;
-        case '"':
-            escaped += "&quot;";
-            break;
-        case '\'':
-            escaped += "&#39;";
-            break;
-        default:
-            escaped += value[i];
-            break;
-        }
-    }
-    return escaped;
-}
 
 void appendJsonString(String &json, const String &value)
 {
@@ -113,32 +66,16 @@ WiFiTuner::WiFiTuner()
       _notificationStartedUs(0),
       _notificationDurationUs(0),
       _notificationActive(false),
-      _presetStorageReady(false),
       _stationMode(false)
 {
 }
 
 WiFiTuner::~WiFiTuner()
 {
-    if (_presetStorageReady)
-        _presetPreferences.end();
-
     for (int i = 0; i < _parameterCount; i++)
     {
         free(_parameters[i].optionValues);
         _parameters[i].optionValues = nullptr;
-    }
-}
-
-void WiFiTuner::initializePresetStorage()
-{
-    if (!_presetStorageReady)
-    {
-        _presetStorageReady = _presetPreferences.begin("tuner", false);
-        if (_presetStorageReady)
-            restoreLastPreset();
-        else
-            Serial.println("[Tuner] Failed to open preset storage");
     }
 }
 
@@ -150,20 +87,8 @@ void WiFiTuner::configureServer()
     _server.on("/api/schema", HTTP_GET, [this]()
                { handleSchema(); });
 
-    _server.on("/presets", HTTP_GET, [this]()
-               { handlePresetList(); });
-
     _server.on("/update", HTTP_GET, [this]()
                { handleUpdate(); });
-
-    _server.on("/presets/save", HTTP_POST, [this]()
-               { handlePresetSave(); });
-
-    _server.on("/presets/load", HTTP_POST, [this]()
-               { handlePresetLoad(); });
-
-    _server.on("/presets/delete", HTTP_POST, [this]()
-               { handlePresetDelete(); });
 
     _server.on("/button", HTTP_GET, [this]()
                { handleButton(); });
@@ -185,7 +110,6 @@ void WiFiTuner::configureServer()
 
 void WiFiTuner::begin(const char *ssid)
 {
-    initializePresetStorage();
     _stationMode = false;
     WiFi.mode(WIFI_AP);
     if (!WiFi.softAP(ssid, "0123456789"))
@@ -203,7 +127,6 @@ void WiFiTuner::begin(const char *ssid)
 
 void WiFiTuner::begin(const char *ssid, const char *password)
 {
-    initializePresetStorage();
     _stationMode = false;
 
     if (!ssid || !ssid[0])
@@ -901,6 +824,49 @@ WiFiTuner::Parameter *WiFiTuner::findParameter(int index)
     return &_parameters[index];
 }
 
+bool WiFiTuner::getParameterValue(const Parameter &p, double &value) const
+{
+    switch (p.type)
+    {
+    case SLIDER:
+    case ANGLE:
+        value = *(float *)p.value;
+        break;
+    case INT_SLIDER:
+        value = *(int *)p.value;
+        break;
+    case UINT8_SLIDER:
+        value = *(uint8_t *)p.value;
+        break;
+    case UINT16_SLIDER:
+        value = *(uint16_t *)p.value;
+        break;
+    case UINT_SLIDER:
+        value = *(unsigned int *)p.value;
+        break;
+    case ULONG_SLIDER:
+        value = *(unsigned long *)p.value;
+        break;
+    case DROPDOWN:
+    {
+        const double currentValue = dropdownCurrentValue(p);
+        for (int i = 0; i < p.optionCount; ++i)
+        {
+            if (p.optionValues[i] == currentValue)
+            {
+                value = i;
+                return true;
+            }
+        }
+        return false;
+    }
+    default:
+        return false;
+    }
+
+    return isfinite(value);
+}
+
 double WiFiTuner::dropdownCurrentValue(const Parameter &p) const
 {
     switch (p.dropdownKind)
@@ -1129,528 +1095,6 @@ bool WiFiTuner::applyParameterValue(Parameter &p, double value)
     return false;
 }
 
-bool WiFiTuner::isPresetParameter(const Parameter &p) const
-{
-    switch (p.type)
-    {
-    case SLIDER:
-    case ANGLE:
-    case INT_SLIDER:
-    case UINT8_SLIDER:
-    case UINT16_SLIDER:
-    case UINT_SLIDER:
-    case ULONG_SLIDER:
-    case DROPDOWN:
-        return true;
-    default:
-        return false;
-    }
-}
-
-bool WiFiTuner::getPresetParameterValue(const Parameter &p, double &value) const
-{
-    switch (p.type)
-    {
-    case SLIDER:
-    case ANGLE:
-        value = *(float *)p.value;
-        break;
-    case INT_SLIDER:
-        value = *(int *)p.value;
-        break;
-    case UINT8_SLIDER:
-        value = *(uint8_t *)p.value;
-        break;
-    case UINT16_SLIDER:
-        value = *(uint16_t *)p.value;
-        break;
-    case UINT_SLIDER:
-        value = *(unsigned int *)p.value;
-        break;
-    case ULONG_SLIDER:
-        value = *(unsigned long *)p.value;
-        break;
-    case DROPDOWN:
-    {
-        double current = dropdownCurrentValue(p);
-        for (int i = 0; i < p.optionCount; ++i)
-        {
-            if (p.optionValues[i] == current)
-            {
-                value = i;
-                return true;
-            }
-        }
-        return false;
-    }
-    default:
-        return false;
-    }
-
-    return isfinite(value);
-}
-
-bool WiFiTuner::isValidPresetValue(const Parameter &p, double value) const
-{
-    if (!isfinite(value))
-        return false;
-
-    if (p.type == DROPDOWN)
-        return value >= 0.0 && value < p.optionCount && value == floor(value);
-
-    if (p.type == INT_SLIDER || p.type == UINT8_SLIDER ||
-        p.type == UINT16_SLIDER || p.type == UINT_SLIDER ||
-        p.type == ULONG_SLIDER)
-        return value == floor(value);
-
-    return p.type == SLIDER || p.type == ANGLE;
-}
-
-uint16_t WiFiTuner::presetParameterCount() const
-{
-    uint16_t count = 0;
-    for (int i = 0; i < _parameterCount; ++i)
-    {
-        if (isPresetParameter(_parameters[i]))
-            ++count;
-    }
-    return count;
-}
-
-uint32_t WiFiTuner::presetSchemaHash() const
-{
-    uint32_t hash = 2166136261U;
-    auto addBytes = [&hash](const void *data, size_t length)
-    {
-        const uint8_t *bytes = (const uint8_t *)data;
-        for (size_t i = 0; i < length; ++i)
-        {
-            hash ^= bytes[i];
-            hash *= 16777619U;
-        }
-    };
-    auto addString = [&addBytes](const String &value)
-    {
-        uint16_t length = (uint16_t)value.length();
-        addBytes(&length, sizeof(length));
-        addBytes(value.c_str(), length);
-    };
-
-    for (int i = 0; i < _parameterCount; ++i)
-    {
-        const Parameter &p = _parameters[i];
-        if (!isPresetParameter(p))
-            continue;
-
-        addString(p.tab);
-        addString(p.category);
-        addString(p.name);
-        uint8_t type = (uint8_t)p.type;
-        addBytes(&type, sizeof(type));
-
-        if (p.type == DROPDOWN)
-        {
-            uint8_t kind = (uint8_t)p.dropdownKind;
-            uint16_t count = (uint16_t)p.optionCount;
-            addBytes(&kind, sizeof(kind));
-            addBytes(&count, sizeof(count));
-            for (int j = 0; j < p.optionCount; ++j)
-                addBytes(&p.optionValues[j], sizeof(p.optionValues[j]));
-        }
-    }
-
-    return hash;
-}
-
-String WiFiTuner::presetKey(uint8_t slot) const
-{
-    String key = "p";
-    key += String(slot);
-    return key;
-}
-
-bool WiFiTuner::parsePresetSlot(const String &text, uint8_t &slot) const
-{
-    if (!text.length())
-        return false;
-
-    char *end = nullptr;
-    long parsed = strtol(text.c_str(), &end, 10);
-    if (end == text.c_str() || *end != '\0' || parsed < 0 || parsed >= MAX_PRESETS)
-        return false;
-
-    slot = (uint8_t)parsed;
-    return true;
-}
-
-bool WiFiTuner::readPreset(
-    uint8_t slot,
-    String &name,
-    uint32_t &schemaHash,
-    double *values,
-    uint16_t &valueCount)
-{
-    if (!_presetStorageReady || slot >= MAX_PRESETS)
-        return false;
-
-    String key = presetKey(slot);
-    size_t blobLength = _presetPreferences.getBytesLength(key.c_str());
-    const size_t maxBlobLength = sizeof(PresetStorageHeader) +
-                                 MAX_PRESET_NAME_LENGTH +
-                                 MAX_PARAMETERS * sizeof(double);
-    if (blobLength < sizeof(PresetStorageHeader) || blobLength > maxBlobLength)
-        return false;
-
-    uint8_t blob[sizeof(PresetStorageHeader) +
-                 MAX_PRESET_NAME_LENGTH +
-                 MAX_PARAMETERS * sizeof(double)];
-    if (_presetPreferences.getBytes(key.c_str(), blob, blobLength) != blobLength)
-        return false;
-
-    PresetStorageHeader header;
-    memcpy(&header, blob, sizeof(header));
-    if (header.magic != PRESET_MAGIC ||
-        header.version != PRESET_VERSION ||
-        header.nameLength == 0 ||
-        header.nameLength > MAX_PRESET_NAME_LENGTH ||
-        header.valueCount > MAX_PARAMETERS)
-        return false;
-
-    const size_t expectedLength = sizeof(header) +
-                                 header.nameLength +
-                                 header.valueCount * sizeof(double);
-    if (blobLength != expectedLength)
-        return false;
-
-    char nameBuffer[MAX_PRESET_NAME_LENGTH + 1];
-    memcpy(nameBuffer, blob + sizeof(header), header.nameLength);
-    nameBuffer[header.nameLength] = '\0';
-    name = String(nameBuffer);
-
-    const uint8_t *storedValues = blob + sizeof(header) + header.nameLength;
-    memcpy(values, storedValues, header.valueCount * sizeof(double));
-    for (uint16_t i = 0; i < header.valueCount; ++i)
-    {
-        if (!isfinite(values[i]))
-            return false;
-    }
-
-    schemaHash = header.schemaHash;
-    valueCount = header.valueCount;
-    return true;
-}
-
-bool WiFiTuner::findPresetByName(const String &name, uint8_t &slot)
-{
-    double values[MAX_PARAMETERS];
-    for (uint8_t candidate = 0; candidate < MAX_PRESETS; ++candidate)
-    {
-        String key = presetKey(candidate);
-        if (!_presetPreferences.isKey(key.c_str()))
-            continue;
-
-        String storedName;
-        uint32_t schemaHash;
-        uint16_t valueCount;
-        if (readPreset(candidate, storedName, schemaHash, values, valueCount) &&
-            storedName == name)
-        {
-            slot = candidate;
-            return true;
-        }
-    }
-    return false;
-}
-
-bool WiFiTuner::storePreset(
-    const String &name,
-    uint8_t &slot,
-    int &statusCode,
-    String &error)
-{
-    if (!_presetStorageReady)
-    {
-        statusCode = 503;
-        error = "Preset storage is unavailable.";
-        return false;
-    }
-    if (!name.length() || name.length() > MAX_PRESET_NAME_LENGTH)
-    {
-        statusCode = 400;
-        error = "Preset name must be between 1 and 32 bytes.";
-        return false;
-    }
-
-    double values[MAX_PARAMETERS];
-    uint16_t valueCount = 0;
-    for (int i = 0; i < _parameterCount; ++i)
-    {
-        const Parameter &p = _parameters[i];
-        if (!isPresetParameter(p))
-            continue;
-
-        if (!getPresetParameterValue(p, values[valueCount]))
-        {
-            statusCode = 500;
-            error = "A control value could not be saved.";
-            return false;
-        }
-        ++valueCount;
-    }
-
-    if (valueCount == 0)
-    {
-        statusCode = 400;
-        error = "There are no adjustable controls to save.";
-        return false;
-    }
-
-    if (!findPresetByName(name, slot))
-    {
-        bool foundFreeSlot = false;
-        for (uint8_t candidate = 0; candidate < MAX_PRESETS; ++candidate)
-        {
-            String key = presetKey(candidate);
-            if (!_presetPreferences.isKey(key.c_str()))
-            {
-                slot = candidate;
-                foundFreeSlot = true;
-                break;
-            }
-        }
-        if (!foundFreeSlot)
-        {
-            statusCode = 409;
-            error = "Preset storage is full (32 presets maximum).";
-            return false;
-        }
-    }
-
-    PresetStorageHeader header = {};
-    header.magic = PRESET_MAGIC;
-    header.schemaHash = presetSchemaHash();
-    header.version = PRESET_VERSION;
-    header.nameLength = (uint16_t)name.length();
-    header.valueCount = valueCount;
-
-    uint8_t blob[sizeof(PresetStorageHeader) +
-                 MAX_PRESET_NAME_LENGTH +
-                 MAX_PARAMETERS * sizeof(double)];
-    size_t offset = 0;
-    memcpy(blob + offset, &header, sizeof(header));
-    offset += sizeof(header);
-    memcpy(blob + offset, name.c_str(), header.nameLength);
-    offset += header.nameLength;
-    memcpy(blob + offset, values, valueCount * sizeof(double));
-    offset += valueCount * sizeof(double);
-
-    String key = presetKey(slot);
-    if (_presetPreferences.putBytes(key.c_str(), blob, offset) != offset)
-    {
-        statusCode = 500;
-        error = "Failed to write preset data.";
-        return false;
-    }
-    if (_presetPreferences.putUChar(PRESET_LAST_KEY, slot) != sizeof(slot))
-    {
-        statusCode = 500;
-        error = "Preset was saved, but startup restore could not be updated.";
-        return false;
-    }
-
-    statusCode = 200;
-    return true;
-}
-
-bool WiFiTuner::applyPreset(
-    uint8_t slot,
-    bool remember,
-    int &statusCode,
-    String &error)
-{
-    if (!_presetStorageReady)
-    {
-        statusCode = 503;
-        error = "Preset storage is unavailable.";
-        return false;
-    }
-    if (slot >= MAX_PRESETS)
-    {
-        statusCode = 400;
-        error = "Invalid preset.";
-        return false;
-    }
-
-    String key = presetKey(slot);
-    if (!_presetPreferences.isKey(key.c_str()))
-    {
-        statusCode = 404;
-        error = "Preset not found.";
-        return false;
-    }
-
-    String name;
-    uint32_t schemaHash;
-    uint16_t valueCount;
-    double values[MAX_PARAMETERS];
-    if (!readPreset(slot, name, schemaHash, values, valueCount))
-    {
-        statusCode = 500;
-        error = "Preset data is invalid.";
-        return false;
-    }
-
-    if (schemaHash != presetSchemaHash() ||
-        valueCount != presetParameterCount())
-    {
-        statusCode = 409;
-        error = "Preset controls no longer match this firmware. Save it again to update it.";
-        return false;
-    }
-
-    uint16_t valueIndex = 0;
-    for (int i = 0; i < _parameterCount; ++i)
-    {
-        const Parameter &p = _parameters[i];
-        if (!isPresetParameter(p))
-            continue;
-        if (!isValidPresetValue(p, values[valueIndex++]))
-        {
-            statusCode = 500;
-            error = "Preset contains an invalid control value.";
-            return false;
-        }
-    }
-
-    if (remember &&
-        _presetPreferences.putUChar(PRESET_LAST_KEY, slot) != sizeof(slot))
-    {
-        statusCode = 500;
-        error = "Failed to save the startup preset.";
-        return false;
-    }
-
-    valueIndex = 0;
-    for (int i = 0; i < _parameterCount; ++i)
-    {
-        Parameter &p = _parameters[i];
-        if (!isPresetParameter(p))
-            continue;
-        if (!applyParameterValue(p, values[valueIndex++]))
-        {
-            statusCode = 500;
-            error = "Failed to apply preset control values.";
-            return false;
-        }
-    }
-
-    statusCode = 200;
-    return true;
-}
-
-void WiFiTuner::restoreLastPreset()
-{
-    uint8_t slot = _presetPreferences.getUChar(PRESET_LAST_KEY, NO_PRESET);
-    if (slot == NO_PRESET)
-        return;
-    if (slot >= MAX_PRESETS)
-    {
-        Serial.println("[Tuner] Stored startup preset slot is invalid");
-        return;
-    }
-
-    int statusCode;
-    String error;
-    if (!applyPreset(slot, false, statusCode, error))
-        Serial.printf("[Tuner] Could not restore startup preset: %s\n", error.c_str());
-}
-
-String WiFiTuner::presetManagerHTML()
-{
-    String html;
-    const uint8_t lastSlot = _presetStorageReady
-                                 ? _presetPreferences.getUChar(PRESET_LAST_KEY, NO_PRESET)
-                                 : NO_PRESET;
-    const uint32_t currentSchema = presetSchemaHash();
-    const uint16_t currentCount = presetParameterCount();
-    bool hasPresets = false;
-
-    html += "<div class='category'>Presets</div><div class='group'><div id='presetManager' class='parameter preset-manager'>";
-    html += "<label class='label' for='presetSelect'>Load preset</label>";
-    html += "<select id='presetSelect' class='preset-input' onchange='loadSelectedPreset()'";
-    if (!_presetStorageReady)
-        html += " disabled";
-    html += ">";
-
-    if (!_presetStorageReady)
-    {
-        html += "<option value=''>Preset storage unavailable</option>";
-    }
-    else
-    {
-        html += "<option value=''";
-        if (lastSlot == NO_PRESET || lastSlot >= MAX_PRESETS)
-            html += " selected";
-        html += ">Select a preset</option>";
-
-        double values[MAX_PARAMETERS];
-        for (uint8_t slot = 0; slot < MAX_PRESETS; ++slot)
-        {
-            String key = presetKey(slot);
-            if (!_presetPreferences.isKey(key.c_str()))
-                continue;
-
-            hasPresets = true;
-            String name;
-            uint32_t schemaHash;
-            uint16_t valueCount;
-            bool valid = readPreset(slot, name, schemaHash, values, valueCount);
-            bool compatible = valid &&
-                              schemaHash == currentSchema &&
-                              valueCount == currentCount;
-            String safeName = valid ? escapeHtml(name) : String("Invalid preset ") + String(slot);
-
-            html += "<option value='";
-            html += String(slot);
-            html += "' data-name='";
-            html += valid ? escapeHtml(name) : String("");
-            html += "' data-compatible='";
-            html += compatible ? "true" : "false";
-            html += "'";
-            if (slot == lastSlot)
-                html += " selected";
-            html += ">";
-            html += safeName;
-            if (valid && !compatible)
-                html += " (incompatible)";
-            html += "</option>";
-        }
-    }
-
-    html += "</select>";
-    html += "<label class='label' for='presetName'>Name</label>";
-    html += "<input id='presetName' class='preset-input' type='text' maxlength='32' placeholder='Preset name'";
-    if (!_presetStorageReady)
-        html += " disabled";
-    html += ">";
-    html += "<div class='preset-actions'>";
-    html += "<button class='button' type='button' onclick='savePreset()'";
-    if (!_presetStorageReady)
-        html += " disabled";
-    html += ">Save</button>";
-    html += "<button id='presetDeleteButton' class='button' type='button' onclick='deletePreset()'";
-    if (!_presetStorageReady || !hasPresets)
-        html += " disabled";
-    html += ">Delete</button>";
-    html += "</div>";
-    html += "<div id='presetStatus' class='preset-status' role='status' aria-live='polite'>";
-    if (!_presetStorageReady)
-        html += "Preset storage could not be opened.";
-    html += "</div></div></div>";
-
-    return html;
-}
-
 void WiFiTuner::handleRoot()
 {
     _server.send(410, "text/plain", "The tuner interface is available in the Android app.");
@@ -1743,7 +1187,7 @@ void WiFiTuner::handleSchema()
         appendJsonString(response, type);
 
         double value;
-        if (getPresetParameterValue(parameter, value))
+        if (getParameterValue(parameter, value))
         {
             response += ",\"value\":";
             response += String(value, 6);
@@ -1882,165 +1326,6 @@ void WiFiTuner::handleUpdate()
     }
 
     _server.send(200, "text/plain", "OK");
-}
-
-void WiFiTuner::handlePresetList()
-{
-    if (!_presetStorageReady)
-    {
-        _server.send(503, "text/plain", "Preset storage is unavailable.");
-        return;
-    }
-
-    String response = "{\"presets\":[";
-    bool firstPreset = true;
-    const uint32_t currentSchema = presetSchemaHash();
-    const uint16_t currentCount = presetParameterCount();
-    double values[MAX_PARAMETERS];
-
-    for (uint8_t slot = 0; slot < MAX_PRESETS; ++slot)
-    {
-        const String key = presetKey(slot);
-        if (!_presetPreferences.isKey(key.c_str()))
-            continue;
-
-        String name;
-        uint32_t schemaHash = 0;
-        uint16_t valueCount = 0;
-        const bool valid = readPreset(slot, name, schemaHash, values, valueCount);
-
-        if (!firstPreset)
-            response += ',';
-        firstPreset = false;
-
-        response += "{\"slot\":";
-        response += String(slot);
-        response += ",\"name\":";
-        appendJsonString(response, valid ? name : String("Invalid preset ") + String(slot));
-        response += ",\"compatible\":";
-        response += valid && schemaHash == currentSchema && valueCount == currentCount
-                        ? "true"
-                        : "false";
-        response += '}';
-    }
-
-    response += "]}";
-    _server.sendHeader("Cache-Control", "no-store");
-    _server.send(200, "application/json", response);
-}
-
-void WiFiTuner::handlePresetSave()
-{
-    if (!_presetStorageReady)
-    {
-        _server.send(503, "text/plain", "Preset storage is unavailable.");
-        return;
-    }
-    if (!_server.hasArg("name"))
-    {
-        _server.send(400, "text/plain", "Missing preset name.");
-        return;
-    }
-
-    String name = _server.arg("name");
-    name.trim();
-    if (!name.length() || name.length() > MAX_PRESET_NAME_LENGTH)
-    {
-        _server.send(400, "text/plain", "Preset name must be between 1 and 32 bytes.");
-        return;
-    }
-    for (size_t i = 0; i < name.length(); ++i)
-    {
-        uint8_t character = (uint8_t)name[i];
-        if (character < 0x20 || character == 0x7F)
-        {
-            _server.send(400, "text/plain", "Preset name cannot contain control characters.");
-            return;
-        }
-    }
-
-    uint8_t slot;
-    int statusCode;
-    String error;
-    if (!storePreset(name, slot, statusCode, error))
-    {
-        _server.send(statusCode, "text/plain", error);
-        return;
-    }
-
-    _server.send(200, "text/plain", "Preset saved.");
-}
-
-void WiFiTuner::handlePresetLoad()
-{
-    if (notificationActive())
-    {
-        _server.send(423, "text/plain", "Controls are locked by an active notification.");
-        return;
-    }
-    if (!_server.hasArg("slot"))
-    {
-        _server.send(400, "text/plain", "Missing preset.");
-        return;
-    }
-
-    uint8_t slot;
-    if (!parsePresetSlot(_server.arg("slot"), slot))
-    {
-        _server.send(400, "text/plain", "Invalid preset.");
-        return;
-    }
-
-    int statusCode;
-    String error;
-    if (!applyPreset(slot, true, statusCode, error))
-    {
-        _server.send(statusCode, "text/plain", error);
-        return;
-    }
-
-    _server.send(200, "text/plain", "Preset loaded.");
-}
-
-void WiFiTuner::handlePresetDelete()
-{
-    if (!_presetStorageReady)
-    {
-        _server.send(503, "text/plain", "Preset storage is unavailable.");
-        return;
-    }
-    if (!_server.hasArg("slot"))
-    {
-        _server.send(400, "text/plain", "Missing preset.");
-        return;
-    }
-
-    uint8_t slot;
-    if (!parsePresetSlot(_server.arg("slot"), slot))
-    {
-        _server.send(400, "text/plain", "Invalid preset.");
-        return;
-    }
-
-    String key = presetKey(slot);
-    if (!_presetPreferences.isKey(key.c_str()))
-    {
-        _server.send(404, "text/plain", "Preset not found.");
-        return;
-    }
-    if (!_presetPreferences.remove(key.c_str()))
-    {
-        _server.send(500, "text/plain", "Failed to delete preset.");
-        return;
-    }
-    if (_presetPreferences.getUChar(PRESET_LAST_KEY, NO_PRESET) == slot &&
-        !_presetPreferences.remove(PRESET_LAST_KEY))
-    {
-        _server.send(500, "text/plain", "Preset was deleted, but startup restore could not be cleared.");
-        return;
-    }
-
-    _server.send(200, "text/plain", "Preset deleted.");
 }
 
 void WiFiTuner::handleButton()
@@ -2678,40 +1963,9 @@ input[type=range]::-moz-range-thumb {
     cursor: pointer;
 }
 
-.button:disabled,
-.preset-input:disabled {
+.button:disabled {
     opacity: 0.5;
     cursor: not-allowed;
-}
-
-.preset-manager {
-    display: flex;
-    flex-direction: column;
-    gap: 8px;
-}
-
-.preset-input {
-    width: 100%;
-    padding: 8px;
-    box-sizing: border-box;
-}
-
-.preset-actions {
-    display: flex;
-    gap: 8px;
-}
-
-.preset-actions .button {
-    flex: 1;
-}
-
-.preset-status {
-    min-height: 1.2em;
-    color: #bbb;
-}
-
-.preset-status.error {
-    color: #ff7777;
 }
 
 .log-toolbar {
@@ -3023,110 +2277,6 @@ function initializeAngleWheels() {
 
 function dropdownChanged(id, value) {
     sendUpdate(id, value);
-}
-
-function setPresetStatus(message, isError) {
-    const status = document.getElementById('presetStatus');
-    if (!status) return;
-    status.textContent = message;
-    status.classList.toggle('error', isError);
-}
-
-function initializePresetManager() {
-    const select = document.getElementById('presetSelect');
-    const nameInput = document.getElementById('presetName');
-    const deleteButton = document.getElementById('presetDeleteButton');
-    if (!select || !nameInput || !deleteButton) return;
-
-    const option = select.options[select.selectedIndex];
-    deleteButton.disabled = !select.value;
-    if (!select.value || !option) return;
-    if (option.dataset.name) nameInput.value = option.dataset.name;
-    if (option.dataset.compatible !== 'true') {
-        setPresetStatus('This preset does not match the current controls. Save it again to replace it.', true);
-    }
-}
-
-function postPresetAction(path, values, progressMessage) {
-    const buttons = document.querySelectorAll('#presetManager button');
-    buttons.forEach(button => button.disabled = true);
-    setPresetStatus(progressMessage, false);
-
-    return fetch(path, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/x-www-form-urlencoded;charset=UTF-8' },
-        body: new URLSearchParams(values)
-    })
-        .then(response => response.text().then(text => {
-            if (!response.ok) throw new Error(text || response.statusText);
-            return text;
-        }))
-        .then(message => {
-            setPresetStatus(message, false);
-            return true;
-        })
-        .catch(error => {
-            setPresetStatus(error.message, true);
-            return false;
-        })
-        .finally(() => {
-            const select = document.getElementById('presetSelect');
-            buttons.forEach(button => {
-                button.disabled = button.id === 'presetDeleteButton'
-                    ? !select || !select.value
-                    : false;
-            });
-        });
-}
-
-function loadSelectedPreset() {
-    const select = document.getElementById('presetSelect');
-    const nameInput = document.getElementById('presetName');
-    const deleteButton = document.getElementById('presetDeleteButton');
-    if (!select || !nameInput || !deleteButton) return;
-
-    const option = select.options[select.selectedIndex];
-    deleteButton.disabled = !select.value;
-    if (!select.value || !option) return;
-    if (option.dataset.name) nameInput.value = option.dataset.name;
-    if (option.dataset.compatible !== 'true') {
-        setPresetStatus('This preset cannot be loaded with the current controls. Save it again to replace it.', true);
-        return;
-    }
-
-    postPresetAction('/presets/load', { slot: select.value }, 'Loading preset...')
-        .then(success => {
-            if (success) window.location.reload();
-        });
-}
-
-function savePreset() {
-    const nameInput = document.getElementById('presetName');
-    if (!nameInput) return;
-    const name = nameInput.value.trim();
-    if (!name) {
-        setPresetStatus('Enter a preset name.', true);
-        return;
-    }
-
-    postPresetAction('/presets/save', { name }, 'Saving preset...')
-        .then(success => {
-            if (success) window.location.reload();
-        });
-}
-
-function deletePreset() {
-    const select = document.getElementById('presetSelect');
-    if (!select || !select.value) {
-        setPresetStatus('Select a preset to delete.', true);
-        return;
-    }
-    if (!window.confirm('Delete the selected preset?')) return;
-
-    postPresetAction('/presets/delete', { slot: select.value }, 'Deleting preset...')
-        .then(success => {
-            if (success) window.location.reload();
-        });
 }
 
 let parsedLogHeaders = [];
@@ -3759,7 +2909,7 @@ window.addEventListener('load', () => {
     refreshNotification();
     refreshLastSessionStats();
     initializeAngleWheels();
-    initializePresetManager();
+
 });
 window.addEventListener('resize', () => {
     if (!parsedLogHeaders.length) return;
@@ -3833,9 +2983,6 @@ window.addEventListener('resize', () => {
         html += "' id='tab";
         html += String(tabIndex);
         html += "'>";
-
-        if (tabNames[tabIndex] == "Control")
-            html += presetManagerHTML();
 
         if (!_hasDisplay && tabIndex == 0)
         {
